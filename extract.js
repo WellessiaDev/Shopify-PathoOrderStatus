@@ -2112,7 +2112,41 @@ app.get(
   }
 );
 
+// ============================================================
+// TEST SHOPIFY ORDERS ACCESS
+// ============================================================
 
+app.get('/api/test/shopify-orders', async (req, res) => {
+  try {
+
+    const query = `
+      query {
+        orders(first: 1) {
+          nodes {
+            id
+            name
+          }
+        }
+      }
+    `;
+
+    const data =
+      await shopifyGraphQL(query);
+
+    return res.json({
+      success: true,
+      data
+    });
+
+  } catch (error) {
+
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.data || null
+    });
+  }
+});
 // ============================================================
 // CHECK PATHAO CONSIGNMENT
 // ============================================================
