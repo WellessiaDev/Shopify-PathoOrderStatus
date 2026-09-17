@@ -1,0 +1,12 @@
+{
+  "name": "shopify-pathao-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "main": "extract.js",
+  "scripts": {
+    "start": "node extract.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
