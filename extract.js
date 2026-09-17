@@ -2111,6 +2111,42 @@ app.get(
     }
   }
 );
+// ============================================================
+// ADD THIS HERE
+// TEST SHOPIFY SCOPES
+// ============================================================
+
+app.get('/api/test/shopify-scopes', async (req, res) => {
+  try {
+
+    const token = await getShopifyToken();
+
+    const response = await fetch(
+      `https://${SHOP}.myshopify.com/admin/oauth/access_scopes.json`,
+      {
+        method: 'GET',
+        headers: {
+          'X-Shopify-Access-Token': token
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    return res.json({
+      success: response.ok,
+      scopes: data.access_scopes || []
+    });
+
+  } catch (error) {
+
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 
 // ============================================================
 // TEST SHOPIFY ORDERS ACCESS
