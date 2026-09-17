@@ -657,7 +657,7 @@ async function getPathaoOrder(
 ) {
 
   const accessToken =
-    await getAccessToken();
+    await getPathaoToken();
 
 
   const url =
@@ -752,7 +752,7 @@ app.get(
     try {
 
       const token =
-        await getAccessToken();
+        await getPathaoToken();
 
 
       res.json({
@@ -762,10 +762,7 @@ app.get(
           'Pathao authentication working',
 
         access_token_received:
-          !!token,
-
-        refresh_token_received:
-          !!REFRESH_TOKEN
+          !!token
       });
 
 
