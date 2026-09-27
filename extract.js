@@ -285,7 +285,11 @@ async function getPathaoOrder(consignmentId) {
     throw error;
   }
 
-  return data.data || data;
+  const order = data.data || data;
+
+  console.log(`📦 [Pathao] ${consignmentId} -> ${JSON.stringify(order)}`);
+
+  return order;
 }
 
 // ============================================================
@@ -420,15 +424,20 @@ async function createShopifyFulfillmentEvent(fulfillmentId, shopifyStatus, patha
 // SHARED: BUILD A "TARGET" FROM A FULFILLMENT ORDER NODE
 // ============================================================
 
-function extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen) {
+function extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen, companySample) {
   const targets = [];
 
   for (const fulfillment of fulfillmentOrder.fulfillments?.nodes || []) {
     for (const tracking of fulfillment.trackingInfo || []) {
-      const company = String(tracking.company || '').toLowerCase();
+      const rawCompany = tracking.company || '';
+      const company = String(rawCompany).toLowerCase();
       const consignmentId = String(tracking.number || '').trim();
 
       if (!consignmentId) continue;
+
+      if (companySample && companySample.size < 25) {
+        companySample.add(rawCompany === '' ? '(empty)' : rawCompany);
+      }
 
       // Only Pathao shipments
       if (!company.includes(PATHAO_TRACKING_COMPANY)) continue;
@@ -483,7 +492,24 @@ const FULFILLMENT_ORDER_NODE_FIELDS = `
 // exposes orderName / fulfillments / trackingInfo directly.
 // ============================================================
 
+let inFlightFullScan = null;
+
 async function getPathaoFulfillmentTargets() {
+  if (inFlightFullScan) {
+    console.log('⏭ Full fulfillment-order scan already in progress — reusing it instead of starting a second one');
+    return inFlightFullScan;
+  }
+
+  inFlightFullScan = runPathaoFulfillmentTargetsScan();
+
+  try {
+    return await inFlightFullScan;
+  } finally {
+    inFlightFullScan = null;
+  }
+}
+
+async function runPathaoFulfillmentTargetsScan() {
   const since = new Date(Date.now() - POLL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   const query = `
@@ -502,6 +528,7 @@ async function getPathaoFulfillmentTargets() {
 
   const targets = [];
   const seen = new Set();
+  const companySample = new Set();
 
   let after = null;
   let hasNextPage = true;
@@ -525,13 +552,26 @@ async function getPathaoFulfillmentTargets() {
     const connection = data.fulfillmentOrders;
 
     for (const fulfillmentOrder of connection.nodes || []) {
-      targets.push(...extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen));
+      targets.push(...extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen, companySample));
     }
 
     console.log(`  …scanned page ${page} (${connection.nodes?.length || 0} orders, ${targets.length} Pathao targets so far)`);
 
     hasNextPage = Boolean(connection.pageInfo.hasNextPage);
     after = connection.pageInfo.endCursor;
+  }
+
+  if (targets.length === 0 && companySample.size > 0) {
+    console.warn(
+      `⚠️ No fulfillments matched tracking company "${PATHAO_TRACKING_COMPANY}". ` +
+      `Actual tracking-company values seen on recent fulfillments: ${JSON.stringify(Array.from(companySample))}. ` +
+      `If your Pathao integration uses a different label, set PATHAO_TRACKING_COMPANY to match it.`
+    );
+  } else if (targets.length === 0) {
+    console.warn(
+      '⚠️ No fulfillments with any tracking company/number found in the lookback window at all. ' +
+      'Fulfillments may not have tracking info attached, or POLL_LOOKBACK_DAYS may be too short.'
+    );
   }
 
   return targets;
@@ -576,7 +616,14 @@ async function getPathaoFulfillmentTargetsByOrderName(orderName) {
 // ============================================================
 
 async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatus, pathaoStatusSlug = '', pathaoUpdatedAt = null }) {
+  console.log(
+    `🔎 [Sync] consignment=${target.consignment_id} target_order=${target.shopify_order_name} ` +
+    `pathao_merchant_order_id=${merchantOrderId} pathao_status="${pathaoStatus}" pathao_slug="${pathaoStatusSlug}" ` +
+    `current_shopify_status=${target.current_shopify_status}`
+  );
+
   if (!merchantOrderId || !pathaoStatus) {
+    console.log('  ↳ SKIP: merchant_order_id or order_status missing from Pathao response');
     return {
       success: false,
       updated: false,
@@ -589,6 +636,7 @@ async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatu
   // Verify order: Pathao merchant_order_id (#WELL26287635) must match
   // Shopify fulfillmentOrder.orderName (#WELL26287635)
   if (merchantOrderId !== target.shopify_order_name) {
+    console.log(`  ↳ SKIP: order name mismatch — Pathao says "${merchantOrderId}", Shopify fulfillment is "${target.shopify_order_name}"`);
     return {
       success: false,
       updated: false,
@@ -602,7 +650,10 @@ async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatu
 
   const shopifyStatus = mapPathaoStatus(pathaoStatus, pathaoStatusSlug);
 
+  console.log(`  ↳ mapped Pathao status "${pathaoStatus}" (slug "${pathaoStatusSlug}") -> Shopify status: ${shopifyStatus || '(unmapped)'}`);
+
   if (!shopifyStatus) {
+    console.log('  ↳ SKIP: no Shopify delivery status mapping exists for this Pathao status');
     return {
       success: true,
       updated: false,
@@ -615,6 +666,7 @@ async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatu
   }
 
   if (target.current_shopify_status === shopifyStatus) {
+    console.log(`  ↳ SKIP: Shopify already shows "${shopifyStatus}" for this fulfillment, nothing to push`);
     return {
       success: true,
       updated: false,
@@ -626,7 +678,11 @@ async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatu
     };
   }
 
+  console.log(`  ↳ PUSHING to Shopify: fulfillment ${target.fulfillment_id} -> ${shopifyStatus}`);
+
   const event = await createShopifyFulfillmentEvent(target.fulfillment_id, shopifyStatus, pathaoStatus, pathaoUpdatedAt);
+
+  console.log(`  ↳ ✅ Shopify accepted the update, event id ${event.id}, status now ${event.status}`);
 
   return {
     success: true,
@@ -698,6 +754,13 @@ async function runAutomaticStatusSync() {
     const targets = await getPathaoFulfillmentTargets();
 
     console.log(`📦 Pathao fulfillments found: ${targets.length}`);
+    if (targets.length > 0) {
+      console.log(
+        targets
+          .map(t => `   - ${t.shopify_order_name} | consignment=${t.consignment_id} | current_status=${t.current_shopify_status}`)
+          .join('\n')
+      );
+    }
 
     for (const target of targets) {
       stats.checked += 1;
@@ -793,7 +856,11 @@ async function processPathaoWebhookEvent(body) {
   webhookStats.last_event_at = new Date().toISOString();
   webhookStats.received += 1;
 
+  console.log(`📨 [Webhook] raw payload: ${JSON.stringify(body)}`);
+
   const fields = extractPathaoWebhookFields(body);
+
+  console.log(`📨 [Webhook] parsed fields: ${JSON.stringify(fields)}`);
 
   if (!fields.consignmentId || !fields.orderStatus) {
     webhookStats.skipped += 1;
@@ -807,6 +874,8 @@ async function processPathaoWebhookEvent(body) {
       ? await getPathaoFulfillmentTargetsByOrderName(fields.merchantOrderId)
       : [];
 
+    console.log(`📨 [Webhook] targeted lookup for "${fields.merchantOrderId}" returned ${targets.length} Pathao target(s): ${JSON.stringify(targets)}`);
+
     let target = targets.find(t => t.consignment_id === fields.consignmentId) || null;
 
     // Fallback: scan recent fulfillment orders by consignment id
@@ -814,6 +883,7 @@ async function processPathaoWebhookEvent(body) {
     if (!target) {
       console.log(`ℹ️ [Webhook] Targeted lookup missed for ${fields.merchantOrderId || '(no order id)'}, falling back to full scan`);
       target = await findTargetByConsignmentId(fields.consignmentId);
+      console.log(`📨 [Webhook] full-scan fallback result: ${target ? JSON.stringify(target) : 'no match found'}`);
     }
 
     if (!target) {
@@ -828,6 +898,8 @@ async function processPathaoWebhookEvent(body) {
       pathaoStatusSlug: fields.orderStatusSlug,
       pathaoUpdatedAt: fields.updatedAt
     });
+
+    console.log(`📨 [Webhook] final result: ${JSON.stringify(result)}`);
 
     if (result.updated) {
       webhookStats.updated += 1;
@@ -884,6 +956,7 @@ app.get('/', (req, res) => {
       pathao_auth: 'GET /api/test/pathao',
       shopify_test: 'GET /api/test/shopify-fulfillment-orders',
       pathao_order: 'GET /api/pathao/order/:consignment_id',
+      debug_trace: 'GET /api/debug/:consignment_id',
       manual_sync: 'POST /api/sync/:consignment_id',
       auto_sync_status: 'GET /api/auto-sync/status',
       auto_sync_run: 'POST /api/auto-sync/run',
@@ -974,6 +1047,41 @@ app.get('/api/pathao/order/:consignment_id', async (req, res) => {
       details: error.data || null
     });
   }
+});
+
+// ============================================================
+// DEBUG: TRACE ONE CONSIGNMENT END-TO-END (read-only, no push)
+// ============================================================
+
+app.get('/api/debug/:consignment_id', async (req, res) => {
+  const consignmentId = req.params.consignment_id;
+  const trace = { consignment_id: consignmentId };
+
+  try {
+    trace.pathao_order = await getPathaoOrder(consignmentId);
+  } catch (error) {
+    trace.pathao_order_error = error.message;
+  }
+
+  try {
+    trace.shopify_target_by_full_scan = await findTargetByConsignmentId(consignmentId);
+  } catch (error) {
+    trace.shopify_lookup_error = error.message;
+  }
+
+  if (trace.pathao_order?.merchant_order_id) {
+    try {
+      trace.shopify_targets_by_order_name = await getPathaoFulfillmentTargetsByOrderName(trace.pathao_order.merchant_order_id);
+    } catch (error) {
+      trace.shopify_targeted_lookup_error = error.message;
+    }
+  }
+
+  if (trace.pathao_order && !trace.pathao_order_error) {
+    trace.mapped_shopify_status = mapPathaoStatus(trace.pathao_order.order_status, trace.pathao_order.order_status_slug);
+  }
+
+  res.json({ success: true, trace });
 });
 
 // ============================================================
