@@ -169,7 +169,13 @@ async function getPathaoToken() {
 // SHOPIFY GRAPHQL
 // ============================================================
 
-async function shopifyGraphQL(query, variables = {}) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const MAX_THROTTLE_RETRIES = 5;
+
+async function shopifyGraphQL(query, variables = {}, attempt = 1) {
   const token = await getShopifyToken();
 
   const response = await fetch(`https://${SHOP}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
@@ -198,6 +204,26 @@ async function shopifyGraphQL(query, variables = {}) {
   }
 
   if (payload.errors?.length) {
+    const isThrottled = payload.errors.some(item => item.extensions?.code === 'THROTTLED');
+
+    if (isThrottled && attempt <= MAX_THROTTLE_RETRIES) {
+      const throttleStatus = payload.extensions?.cost?.throttleStatus;
+
+      let waitMs = 1000 * attempt; // fallback exponential-ish backoff
+
+      if (throttleStatus && Number(throttleStatus.restoreRate) > 0) {
+        const maximumAvailable = Number(throttleStatus.maximumAvailable) || 1000;
+        const currentlyAvailable = Number(throttleStatus.currentlyAvailable) || 0;
+        const needed = Math.max(0, maximumAvailable * 0.5 - currentlyAvailable);
+        waitMs = Math.max(500, Math.ceil((needed / Number(throttleStatus.restoreRate)) * 1000));
+      }
+
+      console.warn(`⏳ Shopify GraphQL throttled — retrying in ${waitMs}ms (attempt ${attempt}/${MAX_THROTTLE_RETRIES})`);
+      await sleep(waitMs);
+
+      return shopifyGraphQL(query, variables, attempt + 1);
+    }
+
     const error = new Error(payload.errors.map(item => item.message).join('; '));
     error.status = 400;
     error.data = payload.errors;
@@ -499,7 +525,7 @@ async function getPathaoFulfillmentTargetsByOrderName(orderName) {
     }
   `;
 
-  const data = await shopifyGraphQL(query, { search: `name:${normalizedName}` });
+  const data = await shopifyGraphQL(query, { search: `order_name:${normalizedName}` });
 
   const targets = [];
   for (const fulfillmentOrder of data.fulfillmentOrders?.nodes || []) {
@@ -754,6 +780,7 @@ async function processPathaoWebhookEvent(body) {
     // Fallback: scan recent fulfillment orders by consignment id
     // (covers cases where merchant_order_id was missing/mismatched).
     if (!target) {
+      console.log(`ℹ️ [Webhook] Targeted lookup missed for ${fields.merchantOrderId || '(no order id)'}, falling back to full scan`);
       target = await findTargetByConsignmentId(fields.consignmentId);
     }
 
@@ -784,6 +811,27 @@ async function processPathaoWebhookEvent(body) {
       JSON.stringify(error.data || { message: error.message }, null, 2)
     );
   }
+}
+
+// ============================================================
+// PATHAO WEBHOOK — SERIALIZE EVENT PROCESSING
+//
+// If several events arrive in a burst (e.g. a bulk status update),
+// process them one at a time rather than all at once, so we don't
+// pile on concurrent Shopify API calls and trip its rate limit.
+// ============================================================
+
+let webhookQueue = Promise.resolve();
+
+function enqueuePathaoWebhookEvent(body) {
+  webhookQueue = webhookQueue
+    .then(() => processPathaoWebhookEvent(body))
+    .catch(error => {
+      webhookStats.errors += 1;
+      console.error('❌ Unhandled error processing Pathao webhook event:', error);
+    });
+
+  return webhookQueue;
 }
 
 // ============================================================
@@ -1002,10 +1050,7 @@ app.post('/webhooks/pathao', (req, res) => {
   // Acknowledge immediately (must respond within 10s), then process.
   res.status(202).json({ success: true, received: true });
 
-  processPathaoWebhookEvent(body).catch(error => {
-    webhookStats.errors += 1;
-    console.error('❌ Unhandled error processing Pathao webhook event:', error);
-  });
+  enqueuePathaoWebhookEvent(body);
 });
 
 // ============================================================
