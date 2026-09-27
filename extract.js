@@ -396,7 +396,11 @@ function extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen) {
         shopify_order_name: fulfillmentOrder.orderName,
         fulfillment_id: fulfillment.id,
         consignment_id: consignmentId,
-        current_shopify_status: fulfillment.events?.nodes?.[0]?.status || null
+        // NOTE: Fulfillment.events requires a scope this app's token
+        // doesn't have ("Access denied for events field"), so we use
+        // displayStatus (Shopify's own current-status summary) as the
+        // dedup baseline instead of the last fulfillment event.
+        current_shopify_status: fulfillment.displayStatus || null
       });
     }
   }
@@ -419,13 +423,6 @@ const FULFILLMENT_ORDER_NODE_FIELDS = `
         company
         number
         url
-      }
-      events(first: 1, reverse: true, sortKey: HAPPENED_AT) {
-        nodes {
-          id
-          status
-          happenedAt
-        }
       }
     }
   }
