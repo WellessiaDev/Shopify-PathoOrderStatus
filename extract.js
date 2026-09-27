@@ -99,9 +99,7 @@ async function fetchTimeout(
         signal: controller.signal
       }
     );
-
   } catch (error) {
-
     if (
       error.name === "AbortError"
     ) {
@@ -111,7 +109,6 @@ async function fetchTimeout(
     }
 
     throw error;
-
   } finally {
     clearTimeout(timer);
   }
@@ -371,6 +368,7 @@ async function getPathaoOrderStatus(
 
 // ============================================================
 // EXACT SHOPIFY ORDER LOOKUP
+// FIXED: fulfillments is direct list, NOT nodes
 // ============================================================
 
 async function getExactShopifyOrder(
@@ -404,15 +402,13 @@ async function getExactShopifyOrder(
           }
 
           fulfillments(first: 20) {
-            nodes {
-              id
-              status
+            id
+            status
 
-              trackingInfo {
-                company
-                number
-                url
-              }
+            trackingInfo {
+              company
+              number
+              url
             }
           }
 
@@ -489,7 +485,6 @@ async function getExactShopifyOrder(
     return null;
   }
 
-  // Safety check
   if (
     normalizeOrderName(
       exact.name
@@ -504,7 +499,7 @@ async function getExactShopifyOrder(
 }
 
 // ============================================================
-// SAVE TRACKING INFORMATION ON SHOPIFY ORDER
+// SAVE TRACKING INFO ON ORDER METAFIELDS
 // ============================================================
 
 async function savePathaoTrackingOnOrder(
@@ -519,7 +514,6 @@ async function savePathaoTrackingOnOrder(
       orderUpdate(
         input: $input
       ) {
-
         order {
           id
           name
@@ -585,7 +579,6 @@ async function savePathaoTrackingOnOrder(
           value:
             TRACKING_CARRIER
         }
-
       ]
     }
   };
@@ -614,14 +607,14 @@ async function savePathaoTrackingOnOrder(
   }
 
   console.log(
-    `   ✅ Tracking saved to order`
+    "   ✅ Pathao tracking saved on Shopify order"
   );
 
   return true;
 }
 
 // ============================================================
-// GET FRESH FULFILLMENT ORDER
+// GET FULFILLMENT ORDER
 // ============================================================
 
 async function getFulfillmentOrder(
@@ -664,7 +657,7 @@ async function getFulfillmentOrder(
 }
 
 // ============================================================
-// RELEASE ON_HOLD
+// RELEASE HOLD
 // ============================================================
 
 async function releaseFulfillmentHold(
@@ -703,7 +696,6 @@ async function releaseFulfillmentHold(
         id: $id,
         holdIds: $holdIds
       ) {
-
         fulfillmentOrder {
           id
           status
@@ -755,7 +747,7 @@ async function releaseFulfillmentHold(
 }
 
 // ============================================================
-// CREATE FULFILLMENT WITH TRACKING
+// CREATE FULFILLMENT + TRACKING
 // ============================================================
 
 async function createFulfillmentWithTracking(
@@ -799,12 +791,10 @@ async function createFulfillmentWithTracking(
         false,
 
       lineItemsByFulfillmentOrder: [
-
         {
           fulfillmentOrderId:
             fulfillmentOrderId
         }
-
       ],
 
       trackingInfo: {
@@ -856,7 +846,7 @@ async function createFulfillmentWithTracking(
   }
 
   console.log(
-    `      ✅ Fulfillment created`
+    "      ✅ Fulfillment created"
   );
 
   console.log(
@@ -959,7 +949,7 @@ async function updateFulfillmentTracking(
     1;
 
   console.log(
-    "      ✅ Tracking updated"
+    "      ✅ Existing tracking updated"
   );
 
   return result
@@ -967,7 +957,8 @@ async function updateFulfillmentTracking(
 }
 
 // ============================================================
-// UPDATE TRACKING FOR EXISTING FULFILLMENTS
+// UPDATE TRACKING ON ALL EXISTING FULFILLMENTS
+// FIXED: order.fulfillments is direct array
 // ============================================================
 
 async function updateExistingTracking(
@@ -976,9 +967,7 @@ async function updateExistingTracking(
 ) {
 
   const fulfillments =
-    order
-      ?.fulfillments
-      ?.nodes || [];
+    order?.fulfillments || [];
 
   let updated = 0;
 
@@ -1018,10 +1007,7 @@ async function fulfillShopifyOrder(
   consignmentId
 ) {
 
-  // ========================================================
-  // SAVE TRACKING DATA
-  // ========================================================
-
+  // Always save tracking
   await savePathaoTrackingOnOrder(
     order.id,
     consignmentId
@@ -1080,7 +1066,7 @@ async function fulfillShopifyOrder(
   ) {
 
     console.log(
-      `   📦 Fulfillment: ${fulfillmentOrder.id}`
+      `   📦 Fulfillment Order: ${fulfillmentOrder.id}`
     );
 
     let fresh =
@@ -1102,7 +1088,7 @@ async function fulfillShopifyOrder(
     );
 
     // ======================================================
-    // ALREADY CLOSED
+    // CLOSED
     // ======================================================
 
     if (
@@ -1160,13 +1146,12 @@ async function fulfillShopifyOrder(
         ).toUpperCase();
 
       console.log(
-        `      🔄 New status: ${status}`
+        `      🔄 Status after hold release: ${status}`
       );
 
       if (
         status === "ON_HOLD"
       ) {
-
         throw new Error(
           "Fulfillment still ON_HOLD after release."
         );
@@ -1194,7 +1179,7 @@ async function fulfillShopifyOrder(
     }
 
     console.log(
-      `      ⚠️ Unsupported fulfillment status: ${status}`
+      `      ⚠️ Unsupported status: ${status}`
     );
   }
 
@@ -1205,7 +1190,7 @@ async function fulfillShopifyOrder(
 }
 
 // ============================================================
-// VERIFY PATHAO WEBHOOK
+// VERIFY WEBHOOK
 // ============================================================
 
 function verifyWebhookSignature(
@@ -1231,10 +1216,8 @@ function verifyWebhookSignature(
 // ============================================================
 // PROCESS WEBHOOK
 //
-// NEW RULE:
-//
-// IF PATHAO CONSIGNMENT EXISTS
-// → FULFILL SHOPIFY IMMEDIATELY
+// RULE:
+// IF PATHAO ORDER EXISTS -> FULFILL SHOPIFY
 // ============================================================
 
 async function processWebhook(
@@ -1292,7 +1275,7 @@ async function processWebhook(
   try {
 
     // ======================================================
-    // 1. VERIFY CONSIGNMENT EXISTS IN PATHAO
+    // 1. CHECK PATHAO
     // ======================================================
 
     console.log(
@@ -1316,7 +1299,7 @@ async function processWebhook(
     );
 
     // ======================================================
-    // 2. FIND EXACT SHOPIFY ORDER
+    // 2. EXACT SHOPIFY ORDER
     // ======================================================
 
     const order =
@@ -1331,7 +1314,6 @@ async function processWebhook(
       );
     }
 
-    // Extra safety
     if (
       normalizeOrderName(
         order.name
@@ -1351,15 +1333,11 @@ async function processWebhook(
     );
 
     // ======================================================
-    // 3. FULFILL IMMEDIATELY
+    // 3. FULFILL
     // ======================================================
 
     console.log(
-      "🚚 Pathao order exists"
-    );
-
-    console.log(
-      "➡️ Marking Shopify FULFILLED..."
+      "➡️ Fulfilling Shopify..."
     );
 
     const result =
@@ -1375,7 +1353,6 @@ async function processWebhook(
       stats.updates_sent +=
         result.changed;
 
-      console.log("");
       console.log(
         "✅ SHOPIFY FULFILLED"
       );
@@ -1385,12 +1362,12 @@ async function processWebhook(
     ) {
 
       console.log(
-        "✅ Shopify was already fulfilled"
+        "✅ Already fulfilled — tracking synchronized"
       );
     }
 
     console.log(
-      `🔢 Tracking: ${consignmentId}`
+      `🔢 Tracking number: ${consignmentId}`
     );
 
     console.log(
@@ -1398,7 +1375,7 @@ async function processWebhook(
     );
 
     console.log(
-      `🔗 ${TRACKING_URL}`
+      `🔗 Tracking URL: ${TRACKING_URL}`
     );
 
     stats.webhooks_processed +=
@@ -1435,7 +1412,7 @@ app.get(
         "Pathao → Shopify Auto Fulfillment",
 
       rule:
-        "If order exists in Pathao → Shopify Fulfilled",
+        "If Pathao order exists → Shopify Fulfilled",
 
       tracking: {
 
@@ -1505,7 +1482,7 @@ app.get(
 );
 
 // ============================================================
-// TEST SHOPIFY + PATHAO
+// TEST
 // ============================================================
 
 app.get(
@@ -1559,10 +1536,7 @@ app.post(
     const body =
       req.body || {};
 
-    // ========================================================
-    // PATHAO VERIFICATION HANDSHAKE
-    // ========================================================
-
+    // verification handshake
     if (
       body.event ===
       "webhook_integration"
@@ -1588,10 +1562,7 @@ app.post(
         });
     }
 
-    // ========================================================
-    // SIGNATURE CHECK
-    // ========================================================
-
+    // signature
     if (
       !verifyWebhookSignature(
         signature
@@ -1613,10 +1584,7 @@ app.post(
         });
     }
 
-    // ========================================================
-    // RESPOND TO PATHAO IMMEDIATELY
-    // ========================================================
-
+    // respond immediately
     res
       .status(202)
       .json({
@@ -1626,10 +1594,7 @@ app.post(
         received: true
       });
 
-    // ========================================================
-    // PROCESS ORDER
-    // ========================================================
-
+    // process
     processWebhook(
       body
     )
@@ -1707,25 +1672,21 @@ app.listen(
     console.log("");
 
     console.log(
-      "📌 Webhook:"
-    );
-
-    console.log(
-      "POST /webhooks/pathao"
+      "📌 POST /webhooks/pathao"
     );
 
     console.log("");
 
     console.log(
-      "🔄 NEW RULE:"
+      "🔄 RULE:"
     );
 
     console.log(
-      "1. Pathao sends ANY order webhook"
+      "1. Pathao webhook received"
     );
 
     console.log(
-      "2. Verify consignment exists in Pathao"
+      "2. Verify Pathao consignment exists"
     );
 
     console.log(
@@ -1733,15 +1694,15 @@ app.listen(
     );
 
     console.log(
-      "4. Release ON_HOLD if necessary"
+      "4. Release ON_HOLD if needed"
     );
 
     console.log(
-      "5. Mark Shopify FULFILLED"
+      "5. Fulfill Shopify"
     );
 
     console.log(
-      "6. Add Pathao consignment as tracking number"
+      "6. Tracking number = Pathao consignment"
     );
 
     console.log(
@@ -1749,7 +1710,7 @@ app.listen(
     );
 
     console.log(
-      `8. Tracking URL = ${TRACKING_URL}`
+      `8. URL = ${TRACKING_URL}`
     );
 
     console.log("");
