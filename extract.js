@@ -22,17 +22,12 @@ const PATHAO_CLIENT_SECRET = process.env.PATHAO_CLIENT_SECRET;
 const PATHAO_USERNAME = process.env.PATHAO_USERNAME;
 const PATHAO_PASSWORD = process.env.PATHAO_PASSWORD;
 
-// The secret you enter in the Pathao Merchant Panel webhook integration form.
-// Pathao echoes it back to us on the verification handshake, and sends it
-// on every subsequent event as the X-PATHAO-Signature header.
 const PATHAO_WEBHOOK_SECRET = process.env.PATHAO_WEBHOOK_SECRET || '';
 
 const PORT = Number(process.env.PORT || 3000);
 
-// Check every minute (fallback polling, in addition to the webhook)
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60000);
 
-// Check recent fulfillment orders
 const POLL_LOOKBACK_DAYS = Number(process.env.POLL_LOOKBACK_DAYS || 30);
 
 const PATHAO_TRACKING_COMPANY = String(process.env.PATHAO_TRACKING_COMPANY || 'Pathao').toLowerCase();
@@ -83,7 +78,6 @@ let lastAutoSync = {
   errors: 0
 };
 
-// Webhook stats, separate from the polling stats above.
 let webhookStats = {
   last_event_at: null,
   received: 0,
@@ -92,6 +86,32 @@ let webhookStats = {
   errors: 0,
   rejected_invalid_signature: 0
 };
+
+// ============================================================
+// UTILITIES
+// ============================================================
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 20000);
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ============================================================
 // SHOPIFY ACCESS TOKEN
@@ -117,7 +137,10 @@ async function getShopifyToken() {
   const data = await response.json();
 
   if (!response.ok || !data.access_token) {
-    throw new Error(`Shopify token error ${response.status}: ${data.error_description || data.error || JSON.stringify(data)}`);
+    const error = new Error(`Shopify token error ${response.status}: ${data.error_description || data.error || JSON.stringify(data)}`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
   }
 
   SHOPIFY_TOKEN = data.access_token;
@@ -154,7 +177,10 @@ async function getPathaoToken() {
   const data = await response.json();
 
   if (!response.ok || !data.access_token) {
-    throw new Error(`Pathao token error ${response.status}: ${data.message || data.error || JSON.stringify(data)}`);
+    const error = new Error(`Pathao token error ${response.status}: ${data.message || data.error || JSON.stringify(data)}`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
   }
 
   PATHAO_TOKEN = data.access_token;
@@ -168,31 +194,6 @@ async function getPathaoToken() {
 // ============================================================
 // SHOPIFY GRAPHQL
 // ============================================================
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 20000);
-
-// Node's fetch has no built-in timeout — without this, a single stalled
-// network request (Shopify or Pathao) can hang forever and, for the
-// poller, permanently block it from ever running again.
-async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 const MAX_THROTTLE_RETRIES = 5;
 
@@ -230,7 +231,7 @@ async function shopifyGraphQL(query, variables = {}, attempt = 1) {
     if (isThrottled && attempt <= MAX_THROTTLE_RETRIES) {
       const throttleStatus = payload.extensions?.cost?.throttleStatus;
 
-      let waitMs = 1000 * attempt; // fallback exponential-ish backoff
+      let waitMs = 1000 * attempt;
 
       if (throttleStatus && Number(throttleStatus.restoreRate) > 0) {
         const maximumAvailable = Number(throttleStatus.maximumAvailable) || 1000;
@@ -259,10 +260,14 @@ async function shopifyGraphQL(query, variables = {}, attempt = 1) {
 // ============================================================
 
 async function getPathaoOrder(consignmentId) {
+  if (!consignmentId) {
+    throw new Error('Consignment ID is required');
+  }
+
   const token = await getPathaoToken();
 
   const response = await fetchWithTimeout(
-    `${PATHAO_BASE_URL}/aladdin/api/v1/orders/${encodeURIComponent(consignmentId)}/info`,
+    `${PATHAO_BASE_URL}/aladdin/api/v1/orders/${encodeURIComponent(String(consignmentId))}/info`,
     {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
@@ -312,7 +317,8 @@ function mapPathaoStatus(orderStatus, orderStatusSlug = '') {
     status.includes('waiting for pickup') ||
     status.includes('assigned for pickup') ||
     status.includes('pickup requested') ||
-    status.includes('order created')
+    status.includes('order created') ||
+    status.includes('pending')
   ) {
     return 'CONFIRMED';
   }
@@ -356,7 +362,7 @@ function mapPathaoStatus(orderStatus, orderStatusSlug = '') {
     return 'IN_TRANSIT';
   }
 
-  // Do not incorrectly map these
+  // Do not map these
   if (
     status.includes('return') ||
     status.includes('cancelled') ||
@@ -371,10 +377,14 @@ function mapPathaoStatus(orderStatus, orderStatusSlug = '') {
 }
 
 // ============================================================
-// CREATE SHOPIFY DELIVERY EVENT
+// CREATE SHOPIFY FULFILLMENT EVENT
 // ============================================================
 
 async function createShopifyFulfillmentEvent(fulfillmentId, shopifyStatus, pathaoStatus, pathaoUpdatedAt = null) {
+  if (!fulfillmentId || !shopifyStatus) {
+    throw new Error('fulfillmentId and shopifyStatus are required');
+  }
+
   const mutation = `
     mutation CreateFulfillmentEvent($event: FulfillmentEventInput!) {
       fulfillmentEventCreate(fulfillmentEvent: $event) {
@@ -398,12 +408,14 @@ async function createShopifyFulfillmentEvent(fulfillmentId, shopifyStatus, patha
     message: `Pathao: ${pathaoStatus}`
   };
 
-  // Pathao timestamp example: 2026-09-17 22:49:28 (Bangladesh UTC+6)
   if (pathaoUpdatedAt) {
-    const parsed = new Date(`${String(pathaoUpdatedAt).replace(' ', 'T')}+06:00`);
-
-    if (!Number.isNaN(parsed.getTime())) {
-      event.happenedAt = parsed.toISOString();
+    try {
+      const parsed = new Date(`${String(pathaoUpdatedAt).replace(' ', 'T')}+06:00`);
+      if (!Number.isNaN(parsed.getTime())) {
+        event.happenedAt = parsed.toISOString();
+      }
+    } catch (e) {
+      console.warn('⚠️ Failed to parse Pathao timestamp:', pathaoUpdatedAt);
     }
   }
 
@@ -421,13 +433,17 @@ async function createShopifyFulfillmentEvent(fulfillmentId, shopifyStatus, patha
 }
 
 // ============================================================
-// SHARED: BUILD A "TARGET" FROM A FULFILLMENT ORDER NODE
+// EXTRACT PATHAO TARGETS FROM FULFILLMENT ORDER
 // ============================================================
 
 function extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen, companySample) {
   const targets = [];
 
+  if (!fulfillmentOrder) return targets;
+
   for (const fulfillment of fulfillmentOrder.fulfillments?.nodes || []) {
+    if (!fulfillment) continue;
+
     for (const tracking of fulfillment.trackingInfo || []) {
       const rawCompany = tracking.company || '';
       const company = String(rawCompany).toLowerCase();
@@ -452,10 +468,6 @@ function extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen, co
         shopify_order_name: fulfillmentOrder.orderName,
         fulfillment_id: fulfillment.id,
         consignment_id: consignmentId,
-        // NOTE: Fulfillment.events requires a scope this app's token
-        // doesn't have ("Access denied for events field"), so we use
-        // displayStatus (Shopify's own current-status summary) as the
-        // dedup baseline instead of the last fulfillment event.
         current_shopify_status: fulfillment.displayStatus || null
       });
     }
@@ -485,18 +497,14 @@ const FULFILLMENT_ORDER_NODE_FIELDS = `
 `;
 
 // ============================================================
-// GET SHOPIFY FULFILLMENT ORDERS (bulk, for the polling sync)
-//
-// IMPORTANT: this does NOT use orders(...), so it avoids
-// "Access denied for orders field". Shopify FulfillmentOrder
-// exposes orderName / fulfillments / trackingInfo directly.
+// GET PATHAO FULFILLMENT TARGETS
 // ============================================================
 
 let inFlightFullScan = null;
 
 async function getPathaoFulfillmentTargets() {
   if (inFlightFullScan) {
-    console.log('⏭ Full fulfillment-order scan already in progress — reusing it instead of starting a second one');
+    console.log('⏭ Full fulfillment-order scan already in progress');
     return inFlightFullScan;
   }
 
@@ -533,13 +541,13 @@ async function runPathaoFulfillmentTargetsScan() {
   let after = null;
   let hasNextPage = true;
   let page = 0;
-  const MAX_PAGES = 50; // hard safety cap: 50 x 100 = 5,000 orders max per scan
+  const MAX_PAGES = 50;
 
   while (hasNextPage) {
     page += 1;
 
     if (page > MAX_PAGES) {
-      console.warn(`⚠️ getPathaoFulfillmentTargets: hit MAX_PAGES (${MAX_PAGES}) safety cap, stopping scan early`);
+      console.warn(`⚠️ Hit MAX_PAGES (${MAX_PAGES}) safety cap, stopping scan early`);
       break;
     }
 
@@ -551,26 +559,25 @@ async function runPathaoFulfillmentTargetsScan() {
 
     const connection = data.fulfillmentOrders;
 
+    if (!connection) {
+      console.error('⚠️ No fulfillmentOrders in response');
+      break;
+    }
+
     for (const fulfillmentOrder of connection.nodes || []) {
       targets.push(...extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen, companySample));
     }
 
     console.log(`  …scanned page ${page} (${connection.nodes?.length || 0} orders, ${targets.length} Pathao targets so far)`);
 
-    hasNextPage = Boolean(connection.pageInfo.hasNextPage);
-    after = connection.pageInfo.endCursor;
+    hasNextPage = Boolean(connection.pageInfo?.hasNextPage);
+    after = connection.pageInfo?.endCursor || null;
   }
 
   if (targets.length === 0 && companySample.size > 0) {
     console.warn(
       `⚠️ No fulfillments matched tracking company "${PATHAO_TRACKING_COMPANY}". ` +
-      `Actual tracking-company values seen on recent fulfillments: ${JSON.stringify(Array.from(companySample))}. ` +
-      `If your Pathao integration uses a different label, set PATHAO_TRACKING_COMPANY to match it.`
-    );
-  } else if (targets.length === 0) {
-    console.warn(
-      '⚠️ No fulfillments with any tracking company/number found in the lookback window at all. ' +
-      'Fulfillments may not have tracking info attached, or POLL_LOOKBACK_DAYS may be too short.'
+      `Actual values: ${JSON.stringify(Array.from(companySample))}`
     );
   }
 
@@ -578,8 +585,7 @@ async function runPathaoFulfillmentTargetsScan() {
 }
 
 // ============================================================
-// GET SHOPIFY FULFILLMENT ORDERS BY ORDER NAME (targeted lookup,
-// used by the webhook so we don't have to scan every recent order)
+// GET TARGETS BY ORDER NAME
 // ============================================================
 
 async function getPathaoFulfillmentTargetsByOrderName(orderName) {
@@ -608,22 +614,17 @@ async function getPathaoFulfillmentTargetsByOrderName(orderName) {
 }
 
 // ============================================================
-// APPLY A KNOWN PATHAO STATUS TO A SHOPIFY FULFILLMENT
-//
-// Shared by the polling sync (which fetches the status from the
-// Pathao API) and the webhook handler (which already has the
-// status in the event payload).
+// APPLY PATHAO STATUS TO SHOPIFY
 // ============================================================
 
 async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatus, pathaoStatusSlug = '', pathaoUpdatedAt = null }) {
   console.log(
-    `🔎 [Sync] consignment=${target.consignment_id} target_order=${target.shopify_order_name} ` +
-    `pathao_merchant_order_id=${merchantOrderId} pathao_status="${pathaoStatus}" pathao_slug="${pathaoStatusSlug}" ` +
-    `current_shopify_status=${target.current_shopify_status}`
+    `🔎 [Sync] consignment=${target.consignment_id} order=${target.shopify_order_name} ` +
+    `pathao_status="${pathaoStatus}" current_shopify=${target.current_shopify_status}`
   );
 
   if (!merchantOrderId || !pathaoStatus) {
-    console.log('  ↳ SKIP: merchant_order_id or order_status missing from Pathao response');
+    console.log('  ↳ SKIP: missing merchant_order_id or order_status');
     return {
       success: false,
       updated: false,
@@ -633,15 +634,13 @@ async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatu
     };
   }
 
-  // Verify order: Pathao merchant_order_id (#WELL26287635) must match
-  // Shopify fulfillmentOrder.orderName (#WELL26287635)
   if (merchantOrderId !== target.shopify_order_name) {
-    console.log(`  ↳ SKIP: order name mismatch — Pathao says "${merchantOrderId}", Shopify fulfillment is "${target.shopify_order_name}"`);
+    console.log(`  ↳ SKIP: order mismatch — Pathao="${merchantOrderId}", Shopify="${target.shopify_order_name}"`);
     return {
       success: false,
       updated: false,
       skipped: true,
-      reason: 'Pathao merchant_order_id does not match Shopify orderName',
+      reason: 'Order name mismatch',
       merchant_order_id: merchantOrderId,
       shopify_order_name: target.shopify_order_name,
       consignment_id: target.consignment_id
@@ -650,39 +649,36 @@ async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatu
 
   const shopifyStatus = mapPathaoStatus(pathaoStatus, pathaoStatusSlug);
 
-  console.log(`  ↳ mapped Pathao status "${pathaoStatus}" (slug "${pathaoStatusSlug}") -> Shopify status: ${shopifyStatus || '(unmapped)'}`);
+  console.log(`  ↳ mapped "${pathaoStatus}" -> ${shopifyStatus || '(unmapped)'}`);
 
   if (!shopifyStatus) {
-    console.log('  ↳ SKIP: no Shopify delivery status mapping exists for this Pathao status');
+    console.log('  ↳ SKIP: no Shopify mapping for this Pathao status');
     return {
       success: true,
       updated: false,
       skipped: true,
-      reason: 'Pathao status is not mapped to a Shopify delivery event',
-      merchant_order_id: merchantOrderId,
-      pathao_order_status: pathaoStatus,
-      pathao_order_status_slug: pathaoStatusSlug
+      reason: 'Pathao status has no Shopify mapping',
+      pathao_order_status: pathaoStatus
     };
   }
 
   if (target.current_shopify_status === shopifyStatus) {
-    console.log(`  ↳ SKIP: Shopify already shows "${shopifyStatus}" for this fulfillment, nothing to push`);
+    console.log(`  ↳ SKIP: Shopify already shows "${shopifyStatus}"`);
     return {
       success: true,
       updated: false,
       skipped: true,
-      reason: 'Shopify already has this delivery status',
-      merchant_order_id: merchantOrderId,
+      reason: 'Shopify already has this status',
       pathao_order_status: pathaoStatus,
-      shopify_delivery_status: shopifyStatus
+      shopify_status: shopifyStatus
     };
   }
 
-  console.log(`  ↳ PUSHING to Shopify: fulfillment ${target.fulfillment_id} -> ${shopifyStatus}`);
+  console.log(`  ↳ PUSHING: fulfillment ${target.fulfillment_id} -> ${shopifyStatus}`);
 
   const event = await createShopifyFulfillmentEvent(target.fulfillment_id, shopifyStatus, pathaoStatus, pathaoUpdatedAt);
 
-  console.log(`  ↳ ✅ Shopify accepted the update, event id ${event.id}, status now ${event.status}`);
+  console.log(`  ↳ ✅ Updated, event ${event.id}, status ${event.status}`);
 
   return {
     success: true,
@@ -691,17 +687,14 @@ async function applyPathaoStatusToShopify(target, { merchantOrderId, pathaoStatu
     shopify_order_name: target.shopify_order_name,
     consignment_id: target.consignment_id,
     pathao_order_status: pathaoStatus,
-    pathao_order_status_slug: pathaoStatusSlug,
     previous_shopify_status: target.current_shopify_status,
     shopify_delivery_status: event.status,
-    fulfillment_id: target.fulfillment_id,
     event_id: event.id
   };
 }
 
 // ============================================================
-// SYNC ONE PATHAO ORDER -> SHOPIFY (polling path — calls the
-// Pathao order-info API to find out the current status)
+// SYNC ONE TARGET
 // ============================================================
 
 async function syncTarget(target) {
@@ -716,17 +709,16 @@ async function syncTarget(target) {
 }
 
 // ============================================================
-// FIND TARGET USING CONSIGNMENT ID (full scan fallback)
+// FIND TARGET BY CONSIGNMENT ID
 // ============================================================
 
 async function findTargetByConsignmentId(consignmentId) {
   const targets = await getPathaoFulfillmentTargets();
-
   return targets.find(item => item.consignment_id === String(consignmentId)) || null;
 }
 
 // ============================================================
-// AUTOMATIC SYNC (polling — safety net alongside the webhook)
+// AUTOMATIC SYNC
 // ============================================================
 
 async function runAutomaticStatusSync() {
@@ -753,14 +745,7 @@ async function runAutomaticStatusSync() {
 
     const targets = await getPathaoFulfillmentTargets();
 
-    console.log(`📦 Pathao fulfillments found: ${targets.length}`);
-    if (targets.length > 0) {
-      console.log(
-        targets
-          .map(t => `   - ${t.shopify_order_name} | consignment=${t.consignment_id} | current_status=${t.current_shopify_status}`)
-          .join('\n')
-      );
-    }
+    console.log(`📦 Found: ${targets.length} Pathao fulfillments`);
 
     for (const target of targets) {
       stats.checked += 1;
@@ -777,15 +762,12 @@ async function runAutomaticStatusSync() {
         }
       } catch (error) {
         stats.errors += 1;
-        console.error(
-          `❌ ${target.shopify_order_name} / ${target.consignment_id}:`,
-          JSON.stringify(error.data || { message: error.message }, null, 2)
-        );
+        console.error(`❌ ${target.shopify_order_name} / ${target.consignment_id}:`, error.message);
       }
     }
   } catch (error) {
     stats.errors += 1;
-    console.error('❌ Auto-sync cycle failed:', JSON.stringify(error.data || { message: error.message }, null, 2));
+    console.error('❌ Auto-sync cycle failed:', error.message);
   } finally {
     stats.finished_at = new Date().toISOString();
     lastAutoSync = stats;
@@ -804,11 +786,6 @@ async function runAutomaticStatusSync() {
 
 // ============================================================
 // PATHAO WEBHOOK — SIGNATURE VERIFICATION
-//
-// Per Pathao's docs, the X-PATHAO-Signature header is simply the
-// secret you configured in the Merchant Panel, sent back on every
-// event — not an HMAC of the body. So verification is an equality
-// check (done in constant time to avoid timing attacks).
 // ============================================================
 
 function isValidPathaoSignature(signature) {
@@ -823,72 +800,56 @@ function isValidPathaoSignature(signature) {
 }
 
 // ============================================================
-// PATHAO WEBHOOK — PARSE INCOMING EVENT PAYLOAD
-//
-// Pathao's exact field names can vary slightly by event type, so
-// this pulls from the top level, or a nested "data"/"order" object,
-// whichever is present. Falls back to the "event" name itself
-// (e.g. "Delivered", "Picked Up") when a dedicated order_status
-// field isn't included.
+// EXTRACT PATHAO WEBHOOK FIELDS
 // ============================================================
 
 function extractPathaoWebhookFields(body = {}) {
   const nested = body.data || body.order || {};
 
   const consignmentId = String(body.consignment_id || nested.consignment_id || '').trim() || null;
-
   const merchantOrderId = body.merchant_order_id || nested.merchant_order_id || null;
-
   const orderStatus = body.order_status || nested.order_status || body.event || null;
-
   const orderStatusSlug = body.order_status_slug || nested.order_status_slug || '';
-
   const updatedAt = body.updated_at || nested.updated_at || null;
 
   return { consignmentId, merchantOrderId, orderStatus, orderStatusSlug, updatedAt };
 }
 
 // ============================================================
-// PATHAO WEBHOOK — PROCESS ONE EVENT
+// PROCESS WEBHOOK EVENT
 // ============================================================
 
 async function processPathaoWebhookEvent(body) {
   webhookStats.last_event_at = new Date().toISOString();
   webhookStats.received += 1;
 
-  console.log(`📨 [Webhook] raw payload: ${JSON.stringify(body)}`);
+  console.log(`📨 [Webhook] raw: ${JSON.stringify(body)}`);
 
   const fields = extractPathaoWebhookFields(body);
 
-  console.log(`📨 [Webhook] parsed fields: ${JSON.stringify(fields)}`);
+  console.log(`📨 [Webhook] parsed: ${JSON.stringify(fields)}`);
 
   if (!fields.consignmentId || !fields.orderStatus) {
     webhookStats.skipped += 1;
-    console.log(`⏭ [Webhook] Ignoring event, missing consignment_id or status: ${JSON.stringify(body)}`);
+    console.log(`⏭ [Webhook] Missing consignment_id or status`);
     return;
   }
 
   try {
-    // Fast path: look the order up directly by name.
-    let targets = fields.merchantOrderId
-      ? await getPathaoFulfillmentTargetsByOrderName(fields.merchantOrderId)
-      : [];
+    let targets = fields.merchantOrderId ? await getPathaoFulfillmentTargetsByOrderName(fields.merchantOrderId) : [];
 
-    console.log(`📨 [Webhook] targeted lookup for "${fields.merchantOrderId}" returned ${targets.length} Pathao target(s): ${JSON.stringify(targets)}`);
+    console.log(`📨 [Webhook] targeted lookup returned ${targets.length} target(s)`);
 
     let target = targets.find(t => t.consignment_id === fields.consignmentId) || null;
 
-    // Fallback: scan recent fulfillment orders by consignment id
-    // (covers cases where merchant_order_id was missing/mismatched).
     if (!target) {
-      console.log(`ℹ️ [Webhook] Targeted lookup missed for ${fields.merchantOrderId || '(no order id)'}, falling back to full scan`);
+      console.log(`ℹ️ [Webhook] Falling back to full scan`);
       target = await findTargetByConsignmentId(fields.consignmentId);
-      console.log(`📨 [Webhook] full-scan fallback result: ${target ? JSON.stringify(target) : 'no match found'}`);
     }
 
     if (!target) {
       webhookStats.skipped += 1;
-      console.log(`⏭ [Webhook] No matching Shopify fulfillment for consignment ${fields.consignmentId}`);
+      console.log(`⏭ [Webhook] No matching Shopify fulfillment`);
       return;
     }
 
@@ -899,8 +860,6 @@ async function processPathaoWebhookEvent(body) {
       pathaoUpdatedAt: fields.updatedAt
     });
 
-    console.log(`📨 [Webhook] final result: ${JSON.stringify(result)}`);
-
     if (result.updated) {
       webhookStats.updated += 1;
       console.log(`✅ [Webhook] ${target.shopify_order_name} | ${fields.orderStatus} -> ${result.shopify_delivery_status}`);
@@ -910,19 +869,12 @@ async function processPathaoWebhookEvent(body) {
     }
   } catch (error) {
     webhookStats.errors += 1;
-    console.error(
-      `❌ [Webhook] ${fields.merchantOrderId || ''} / ${fields.consignmentId}:`,
-      JSON.stringify(error.data || { message: error.message }, null, 2)
-    );
+    console.error(`❌ [Webhook] ${fields.merchantOrderId || ''}:`, error.message);
   }
 }
 
 // ============================================================
-// PATHAO WEBHOOK — SERIALIZE EVENT PROCESSING
-//
-// If several events arrive in a burst (e.g. a bulk status update),
-// process them one at a time rather than all at once, so we don't
-// pile on concurrent Shopify API calls and trip its rate limit.
+// WEBHOOK QUEUE
 // ============================================================
 
 let webhookQueue = Promise.resolve();
@@ -932,184 +884,109 @@ function enqueuePathaoWebhookEvent(body) {
     .then(() => processPathaoWebhookEvent(body))
     .catch(error => {
       webhookStats.errors += 1;
-      console.error('❌ Unhandled error processing Pathao webhook event:', error);
+      console.error('❌ Unhandled webhook error:', error.message);
     });
 
   return webhookQueue;
 }
 
 // ============================================================
-// ROOT
+// ROUTES
 // ============================================================
 
 app.get('/', (req, res) => {
   res.json({
     success: true,
     service: 'Pathao -> Shopify Delivery Status Sync',
-    shopify_lookup: 'fulfillmentOrders',
-    orders_query: false,
-    auto_sync: true,
-    webhook_enabled: true,
-    interval_seconds: Math.round(POLL_INTERVAL_MS / 1000),
     endpoints: {
       health: 'GET /health',
-      pathao_auth: 'GET /api/test/pathao',
-      shopify_test: 'GET /api/test/shopify-fulfillment-orders',
+      pathao_test: 'GET /api/test/pathao',
+      shopify_test: 'GET /api/test/shopify',
       pathao_order: 'GET /api/pathao/order/:consignment_id',
-      debug_trace: 'GET /api/debug/:consignment_id',
-      manual_sync: 'POST /api/sync/:consignment_id',
+      debug: 'GET /api/debug/:consignment_id',
+      sync_manual: 'POST /api/sync/:consignment_id',
       auto_sync_status: 'GET /api/auto-sync/status',
       auto_sync_run: 'POST /api/auto-sync/run',
       webhook_status: 'GET /api/webhook/status',
-      pathao_webhook: 'POST /webhooks/pathao'
+      webhook: 'POST /webhooks/pathao'
     }
   });
 });
-
-// ============================================================
-// HEALTH
-// ============================================================
 
 app.get('/health', (req, res) => {
   res.json({ success: true, status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// ============================================================
-// TEST PATHAO AUTH
-// ============================================================
-
 app.get('/api/test/pathao', async (req, res) => {
   try {
     const token = await getPathaoToken();
-
     res.json({
       success: true,
       message: 'Pathao API authentication working',
-      environment: PATHAO_BASE_URL.includes('sandbox') ? 'sandbox' : 'production',
-      access_token_received: Boolean(token)
+      environment: PATHAO_BASE_URL.includes('sandbox') ? 'sandbox' : 'production'
     });
   } catch (error) {
-    res.status(error.status || 500).json({ success: false, error: error.message, details: error.data || null });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
-// ============================================================
-// TEST SHOPIFY FULFILLMENT ORDER ACCESS
-// (does NOT query orders(...))
-// ============================================================
-
-app.get('/api/test/shopify-fulfillment-orders', async (req, res) => {
+app.get('/api/test/shopify', async (req, res) => {
   try {
-    const query = `
-      query {
-        fulfillmentOrders(first: 5, includeClosed: true) {
-          nodes {
-            id
-            orderName
-            orderId
-            status
-            updatedAt
-          }
-        }
-      }
-    `;
-
+    const query = `query { fulfillmentOrders(first: 1) { nodes { id orderName } } }`;
     const data = await shopifyGraphQL(query);
-
     res.json({ success: true, data });
   } catch (error) {
-    res.status(error.status || 500).json({ success: false, error: error.message, details: error.data || null });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
-
-// ============================================================
-// CHECK PATHAO ORDER
-// ============================================================
 
 app.get('/api/pathao/order/:consignment_id', async (req, res) => {
   try {
     const order = await getPathaoOrder(req.params.consignment_id);
-
     res.json({
       success: true,
       consignment_id: order.consignment_id || req.params.consignment_id,
       merchant_order_id: order.merchant_order_id || null,
       order_status: order.order_status || null,
-      order_status_slug: order.order_status_slug || null,
-      updated_at: order.updated_at || null,
-      data: order
+      updated_at: order.updated_at || null
     });
   } catch (error) {
-    res.status(error.status || 500).json({
-      success: false,
-      consignment_id: req.params.consignment_id,
-      error: error.message,
-      details: error.data || null
-    });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
-// ============================================================
-// DEBUG: TRACE ONE CONSIGNMENT END-TO-END (read-only, no push)
-// ============================================================
-
 app.get('/api/debug/:consignment_id', async (req, res) => {
-  const consignmentId = req.params.consignment_id;
-  const trace = { consignment_id: consignmentId };
+  const trace = { consignment_id: req.params.consignment_id };
 
   try {
-    trace.pathao_order = await getPathaoOrder(consignmentId);
+    trace.pathao_order = await getPathaoOrder(req.params.consignment_id);
   } catch (error) {
-    trace.pathao_order_error = error.message;
+    trace.pathao_error = error.message;
   }
 
   try {
-    trace.shopify_target_by_full_scan = await findTargetByConsignmentId(consignmentId);
+    trace.shopify_target = await findTargetByConsignmentId(req.params.consignment_id);
   } catch (error) {
-    trace.shopify_lookup_error = error.message;
-  }
-
-  if (trace.pathao_order?.merchant_order_id) {
-    try {
-      trace.shopify_targets_by_order_name = await getPathaoFulfillmentTargetsByOrderName(trace.pathao_order.merchant_order_id);
-    } catch (error) {
-      trace.shopify_targeted_lookup_error = error.message;
-    }
-  }
-
-  if (trace.pathao_order && !trace.pathao_order_error) {
-    trace.mapped_shopify_status = mapPathaoStatus(trace.pathao_order.order_status, trace.pathao_order.order_status_slug);
+    trace.shopify_error = error.message;
   }
 
   res.json({ success: true, trace });
 });
-
-// ============================================================
-// MANUAL SYNC ONE CONSIGNMENT
-// ============================================================
 
 app.post('/api/sync/:consignment_id', async (req, res) => {
   try {
     const target = await findTargetByConsignmentId(req.params.consignment_id);
 
     if (!target) {
-      return res.status(404).json({
-        success: false,
-        error: 'No Shopify Pathao fulfillment found with this consignment ID'
-      });
+      return res.status(404).json({ success: false, error: 'No Shopify fulfillment found for this consignment ID' });
     }
 
     const result = await syncTarget(target);
-
     return res.json(result);
   } catch (error) {
-    return res.status(error.status || 500).json({ success: false, error: error.message, details: error.data || null });
+    return res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
-
-// ============================================================
-// AUTO SYNC STATUS
-// ============================================================
 
 app.get('/api/auto-sync/status', (req, res) => {
   res.json({
@@ -1122,23 +999,14 @@ app.get('/api/auto-sync/status', (req, res) => {
   });
 });
 
-// ============================================================
-// MANUAL AUTO SYNC RUN
-// ============================================================
-
 app.post('/api/auto-sync/run', async (req, res) => {
   if (autoSyncRunning) {
     return res.status(409).json({ success: false, message: 'Auto-sync is already running' });
   }
 
   const result = await runAutomaticStatusSync();
-
   return res.json({ success: true, result });
 });
-
-// ============================================================
-// WEBHOOK STATUS
-// ============================================================
 
 app.get('/api/webhook/status', (req, res) => {
   res.json({
@@ -1148,61 +1016,38 @@ app.get('/api/webhook/status', (req, res) => {
   });
 });
 
-// ============================================================
-// PATHAO WEBHOOK
-//
-// Handles two kinds of requests:
-//
-// 1. The one-time verification handshake Pathao sends when you
-//    click "Add Webhook" in the Merchant Panel:
-//      { "event": "webhook_integration" }
-//    We must reply with HTTP 202 and a
-//    X-Pathao-Merchant-Webhook-Integration-Secret header whose
-//    value exactly matches the secret you entered in that form.
-//
-// 2. Every real delivery-status event afterwards (Order Created,
-//    Picked Up, In Transit, Delivered, etc.), which arrives with
-//    an X-PATHAO-Signature header equal to that same secret. We
-//    verify it, acknowledge immediately (202), and update the
-//    matching Shopify fulfillment in the background.
-// ============================================================
-
 app.post('/webhooks/pathao', (req, res) => {
   const body = req.body || {};
 
-  // 1. Verification handshake
+  // Verification handshake
   if (body.event === 'webhook_integration') {
-    console.log('✅ Pathao webhook verification handshake received');
-
+    console.log('✅ Pathao webhook verification handshake');
     res.set('X-Pathao-Merchant-Webhook-Integration-Secret', PATHAO_WEBHOOK_SECRET);
-    return res.status(202).json({ success: true, message: 'Webhook verified' });
+    return res.status(202).json({ success: true, message: 'Verified' });
   }
 
-  // 2. Real event — verify signature first
+  // Verify signature
   const signature = req.get('X-PATHAO-Signature') || req.get('X-Pathao-Signature');
 
   if (!isValidPathaoSignature(signature)) {
     webhookStats.rejected_invalid_signature += 1;
-    console.warn('⚠️ Rejected Pathao webhook: invalid or missing X-PATHAO-Signature');
+    console.warn('⚠️ Rejected webhook: invalid signature');
     return res.status(401).json({ success: false, error: 'Invalid signature' });
   }
 
-  // Acknowledge immediately (must respond within 10s), then process.
+  // Acknowledge immediately
   res.status(202).json({ success: true, received: true });
 
+  // Process in background
   enqueuePathaoWebhookEvent(body);
 });
 
-// ============================================================
-// 404
-// ============================================================
-
 app.use((req, res) => {
-  res.status(404).json({ success: false, error: 'Endpoint not found', path: req.path });
+  res.status(404).json({ success: false, error: 'Endpoint not found' });
 });
 
 // ============================================================
-// START
+// START SERVER
 // ============================================================
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -1210,26 +1055,23 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('🚀 PATHAO -> SHOPIFY STATUS SYNC');
   console.log(`🌐 Port: ${PORT}`);
   console.log(`🏪 Shopify: ${SHOP}.myshopify.com`);
-  console.log(`📡 Shopify API: ${SHOPIFY_API_VERSION}`);
-  console.log(`🚚 Pathao: ${PATHAO_BASE_URL}`);
-  console.log('🧾 Shopify lookup: fulfillmentOrders');
-  console.log('🚫 orders(...) query: DISABLED');
-  console.log(`🔄 Poll interval (fallback): ${POLL_INTERVAL_MS / 1000} seconds`);
+  console.log(`🚚 Pathao: ${PATHAO_BASE_URL.includes('sandbox') ? 'SANDBOX' : 'PRODUCTION'}`);
+  console.log(`🔄 Poll interval: ${Math.round(POLL_INTERVAL_MS / 1000)}s`);
   console.log(`📅 Lookback: ${POLL_LOOKBACK_DAYS} days`);
-  console.log(`🪝 Pathao webhook: ${PATHAO_WEBHOOK_SECRET ? 'ENABLED' : 'ENABLED (⚠️ secret not set)'}`);
+  console.log(`🪝 Webhook: ${PATHAO_WEBHOOK_SECRET ? 'ENABLED' : 'ENABLED (⚠️ secret not set)'}`);
   console.log('============================================');
 
-  // First automatic check, 5 seconds after start.
+  // First sync 5 seconds after start
   setTimeout(() => {
     runAutomaticStatusSync().catch(error => {
-      console.error('Initial auto-sync error:', error);
+      console.error('Initial auto-sync error:', error.message);
     });
   }, 5000);
 
-  // Every POLL_INTERVAL_MS, as a safety net alongside the webhook.
+  // Periodic sync
   setInterval(() => {
     runAutomaticStatusSync().catch(error => {
-      console.error('Auto-sync error:', error);
+      console.error('Auto-sync error:', error.message);
     });
   }, POLL_INTERVAL_MS);
 });
