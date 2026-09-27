@@ -139,39 +139,6 @@ function buildTrackingUrl(
 }
 
 // ============================================================
-// GET PHONE FROM PATHAO RESPONSE
-// ============================================================
-
-function getPathaoPhone(pathaoOrder) {
-
-  const possiblePhone =
-
-    pathaoOrder?.recipient_phone ||
-
-    pathaoOrder?.recipientPhone ||
-
-    pathaoOrder?.customer_phone ||
-
-    pathaoOrder?.customerPhone ||
-
-    pathaoOrder?.phone ||
-
-    pathaoOrder?.recipient?.phone ||
-
-    pathaoOrder?.customer?.phone ||
-
-    pathaoOrder?.delivery_address?.phone ||
-
-    pathaoOrder?.deliveryAddress?.phone ||
-
-    "";
-
-  return String(
-    possiblePhone
-  ).trim();
-}
-
-// ============================================================
 // SHOPIFY TOKEN
 // ============================================================
 
@@ -412,12 +379,9 @@ async function getPathaoOrder(
   let data = {};
 
   try {
-
     data =
       await response.json();
-
   } catch (_) {
-
     data = {};
   }
 
@@ -433,9 +397,7 @@ async function getPathaoOrder(
 
 // ============================================================
 // FIND EXACT SHOPIFY ORDER
-//
-// SEARCH NEWEST -> OLDEST
-// DOES NOT USE ROOT orders QUERY
+// NEWEST -> OLDEST
 // ============================================================
 
 async function getShopifyOrderByName(
@@ -461,7 +423,6 @@ async function getShopifyOrderByName(
       ) {
 
         nodes {
-
           id
           orderId
           orderName
@@ -475,9 +436,7 @@ async function getShopifyOrderByName(
           }
 
           fulfillments(first: 20) {
-
             nodes {
-
               id
               status
 
@@ -563,10 +522,6 @@ async function getShopifyOrderByName(
         `   🔎 Checked ${checked} fulfillment orders`
       );
 
-      console.log(
-        `   📦 Matches: ${exactMatches.length}`
-      );
-
       return {
 
         id:
@@ -608,11 +563,83 @@ async function getShopifyOrderByName(
     `   ❌ Exact Shopify order not found: ${merchantOrderId}`
   );
 
+  return null;
+}
+
+// ============================================================
+// GET SHOPIFY ORDER PHONE BY EXACT ORDER ID
+// ============================================================
+
+async function getShopifyOrderPhone(
+  orderId
+) {
+
+  const query = `
+    query GetOrderPhone(
+      $id: ID!
+    ) {
+      order(id: $id) {
+        id
+        name
+        phone
+
+        shippingAddress {
+          phone
+        }
+
+        billingAddress {
+          phone
+        }
+
+        customer {
+          defaultPhoneNumber {
+            phoneNumber
+          }
+        }
+      }
+    }
+  `;
+
+  const data =
+    await shopifyGraphQL(
+      query,
+      {
+        id:
+          orderId
+      }
+    );
+
+  const order =
+    data?.order;
+
+  if (!order) {
+
+    throw new Error(
+      `Shopify order not found by ID: ${orderId}`
+    );
+  }
+
+  const phone =
+    order.phone ||
+    order.shippingAddress?.phone ||
+    order.billingAddress?.phone ||
+    order.customer
+      ?.defaultPhoneNumber
+      ?.phoneNumber ||
+    "";
+
+  if (!phone) {
+
+    throw new Error(
+      `No phone number found for Shopify order ${order.name}`
+    );
+  }
+
   console.log(
-    `   🔎 Total checked: ${checked}`
+    `   📱 Shopify phone found: ${phone}`
   );
 
-  return null;
+  return String(phone).trim();
 }
 
 // ============================================================
@@ -645,9 +672,7 @@ async function getFulfillmentOrder(
         }
 
         fulfillments(first: 20) {
-
           nodes {
-
             id
             status
 
@@ -741,7 +766,6 @@ async function releaseFulfillmentHold(
     await shopifyGraphQL(
       mutation,
       {
-
         id:
           fulfillmentOrder.id,
 
@@ -780,8 +804,7 @@ async function releaseFulfillmentHold(
 }
 
 // ============================================================
-// CREATE FULFILLMENT
-// WITH DYNAMIC PATHAO TRACKING URL
+// CREATE FULFILLMENT WITH DYNAMIC TRACKING
 // ============================================================
 
 async function createFulfillment(
@@ -806,7 +829,6 @@ async function createFulfillment(
       ) {
 
         fulfillment {
-
           id
           status
 
@@ -830,7 +852,6 @@ async function createFulfillment(
     fulfillment: {
 
       lineItemsByFulfillmentOrder: [
-
         {
           fulfillmentOrderId
         }
@@ -942,7 +963,6 @@ async function updateFulfillmentTracking(
       ) {
 
         fulfillment {
-
           id
           status
 
@@ -1008,19 +1028,10 @@ async function updateFulfillmentTracking(
     );
   }
 
-  stats.tracking_updates +=
-    1;
+  stats.tracking_updates += 1;
 
   console.log(
-    "      ✅ Tracking updated"
-  );
-
-  console.log(
-    `      🔢 ${consignmentId}`
-  );
-
-  console.log(
-    `      📱 ${phone}`
+    "      ✅ Existing tracking updated"
   );
 
   console.log(
@@ -1059,10 +1070,6 @@ async function updateExistingFulfillments(
   ) {
 
     try {
-
-      console.log(
-        `      🔄 Updating tracking on ${fulfillment.id}`
-      );
 
       await updateFulfillmentTracking(
         fulfillment.id,
@@ -1108,7 +1115,6 @@ async function processFulfillmentOrder(
     );
   }
 
-  // Exact safety check
   if (
     normalizeOrderName(
       fulfillmentOrder.orderName
@@ -1134,7 +1140,7 @@ async function processFulfillmentOrder(
   );
 
   // ========================================================
-  // CLOSED = ALREADY FULFILLED
+  // CLOSED
   // ========================================================
 
   if (
@@ -1152,9 +1158,7 @@ async function processFulfillmentOrder(
     );
 
     return {
-
       fulfilled: false,
-
       alreadyFulfilled: true
     };
   }
@@ -1172,15 +1176,13 @@ async function processFulfillmentOrder(
     );
 
     return {
-
       fulfilled: false,
-
       cancelled: true
     };
   }
 
   // ========================================================
-  // ON HOLD
+  // ON_HOLD
   // ========================================================
 
   if (
@@ -1232,10 +1234,6 @@ async function processFulfillmentOrder(
     status === "SCHEDULED"
   ) {
 
-    console.log(
-      "      📦 Creating fulfillment..."
-    );
-
     await createFulfillment(
       fulfillmentOrder.id,
       consignmentId,
@@ -1243,9 +1241,7 @@ async function processFulfillmentOrder(
     );
 
     return {
-
       fulfilled: true,
-
       alreadyFulfilled: false
     };
   }
@@ -1261,8 +1257,7 @@ async function processFulfillmentOrder(
 
 async function fulfillExactShopifyOrder(
   merchantOrderId,
-  consignmentId,
-  phone
+  consignmentId
 ) {
 
   const shopifyOrder =
@@ -1277,19 +1272,28 @@ async function fulfillExactShopifyOrder(
     );
   }
 
-  if (
-    normalizeOrderName(
-      shopifyOrder.name
-    ) !==
-    normalizeOrderName(
-      merchantOrderId
-    )
-  ) {
+  // ========================================================
+  // GET PHONE FROM SHOPIFY USING EXACT ORDER ID
+  // ========================================================
 
-    throw new Error(
-      `ORDER MISMATCH BLOCKED: ${merchantOrderId} != ${shopifyOrder.name}`
+  const phone =
+    await getShopifyOrderPhone(
+      shopifyOrder.id
     );
-  }
+
+  const trackingUrl =
+    buildTrackingUrl(
+      consignmentId,
+      phone
+    );
+
+  console.log(
+    `   📱 Shopify phone: ${phone}`
+  );
+
+  console.log(
+    `   🔗 Tracking URL: ${trackingUrl}`
+  );
 
   let fulfilledCount = 0;
   let alreadyCount = 0;
@@ -1327,9 +1331,12 @@ async function fulfillExactShopifyOrder(
   }
 
   return {
-
     orderName:
       shopifyOrder.name,
+
+    phone,
+
+    trackingUrl,
 
     fulfilledCount,
 
@@ -1363,18 +1370,13 @@ function verifyWebhookSignature(
 
 // ============================================================
 // PROCESS WEBHOOK
-//
-// IF PATHAO ORDER EXISTS:
-// -> FULFILL SHOPIFY
-// -> ADD DYNAMIC TRACKING URL
 // ============================================================
 
 async function processWebhook(
   body
 ) {
 
-  stats.webhooks_received +=
-    1;
+  stats.webhooks_received += 1;
 
   stats.last_webhook =
     new Date()
@@ -1425,7 +1427,7 @@ async function processWebhook(
   try {
 
     // ======================================================
-    // 1. VERIFY PATHAO
+    // VERIFY PATHAO ORDER
     // ======================================================
 
     console.log(
@@ -1449,48 +1451,7 @@ async function processWebhook(
     );
 
     // ======================================================
-    // 2. GET PHONE
-    // ======================================================
-
-    const phone =
-      getPathaoPhone(
-        pathaoOrder
-      );
-
-    if (!phone) {
-
-      console.log(
-        "⚠️ Pathao phone number was not found in known fields"
-      );
-
-      console.log(
-        "⚠️ Pathao response keys:",
-        Object.keys(
-          pathaoOrder || {}
-        )
-      );
-
-      throw new Error(
-        `Phone number not found for Pathao order ${consignmentId}`
-      );
-    }
-
-    const trackingUrl =
-      buildTrackingUrl(
-        consignmentId,
-        phone
-      );
-
-    console.log(
-      `📱 Phone: ${phone}`
-    );
-
-    console.log(
-      `🔗 Tracking URL: ${trackingUrl}`
-    );
-
-    // ======================================================
-    // 3. FIND SHOPIFY + FULFILL
+    // SHOPIFY
     // ======================================================
 
     console.log(
@@ -1500,13 +1461,8 @@ async function processWebhook(
     const result =
       await fulfillExactShopifyOrder(
         merchantOrderId,
-        consignmentId,
-        phone
+        consignmentId
       );
-
-    // ======================================================
-    // RESULT
-    // ======================================================
 
     if (
       result.fulfilledCount > 0
@@ -1515,7 +1471,6 @@ async function processWebhook(
       stats.fulfilled +=
         result.fulfilledCount;
 
-      console.log("");
       console.log(
         "✅ SHOPIFY FULFILLED"
       );
@@ -1529,20 +1484,16 @@ async function processWebhook(
         result.alreadyCount;
 
       console.log(
-        "✅ Shopify already fulfilled"
-      );
-
-      console.log(
-        "✅ Tracking synchronized"
+        "✅ Already fulfilled — tracking updated"
       );
     }
 
     console.log(
-      `🔢 Tracking number: ${consignmentId}`
+      `🔢 Tracking: ${consignmentId}`
     );
 
     console.log(
-      `📱 Phone: ${phone}`
+      `📱 Phone: ${result.phone}`
     );
 
     console.log(
@@ -1550,11 +1501,10 @@ async function processWebhook(
     );
 
     console.log(
-      `🔗 Tracking URL: ${trackingUrl}`
+      `🔗 ${result.trackingUrl}`
     );
 
-    stats.webhooks_processed +=
-      1;
+    stats.webhooks_processed += 1;
 
     return true;
 
@@ -1564,8 +1514,7 @@ async function processWebhook(
       `❌ Error: ${error.message}`
     );
 
-    stats.errors +=
-      1;
+    stats.errors += 1;
 
     return false;
   }
@@ -1586,16 +1535,13 @@ app.get(
       service:
         "Pathao → Shopify Auto Fulfillment",
 
-      rule:
-        "If Pathao consignment exists → Shopify Fulfilled",
-
-      search:
-        "Newest Shopify fulfillment orders first",
-
       tracking: {
 
         number:
           "Pathao consignment_id",
+
+        phone:
+          "Shopify order/customer phone",
 
         carrier:
           TRACKING_CARRIER,
@@ -1631,15 +1577,10 @@ app.get(
   (req, res) => {
 
     res.json({
-
       success: true,
-
-      status:
-        "healthy",
-
+      status: "healthy",
       timestamp:
-        new Date()
-          .toISOString()
+        new Date().toISOString()
     });
   }
 );
@@ -1653,16 +1594,14 @@ app.get(
   (req, res) => {
 
     res.json({
-
       success: true,
-
       stats
     });
   }
 );
 
 // ============================================================
-// TEST CONNECTIONS
+// TEST
 // ============================================================
 
 app.get(
@@ -1675,9 +1614,7 @@ app.get(
       await getPathaoToken();
 
       res.json({
-
         success: true,
-
         message:
           "Shopify and Pathao connections OK"
       });
@@ -1687,9 +1624,7 @@ app.get(
       res
         .status(500)
         .json({
-
           success: false,
-
           error:
             error.message
         });
@@ -1716,10 +1651,6 @@ app.post(
     const body =
       req.body || {};
 
-    // ======================================================
-    // VERIFICATION HANDSHAKE
-    // ======================================================
-
     if (
       body.event ===
       "webhook_integration"
@@ -1737,17 +1668,10 @@ app.post(
       return res
         .status(202)
         .json({
-
           success: true,
-
-          message:
-            "Verified"
+          message: "Verified"
         });
     }
-
-    // ======================================================
-    // VERIFY SIGNATURE
-    // ======================================================
 
     if (
       !verifyWebhookSignature(
@@ -1762,44 +1686,30 @@ app.post(
       return res
         .status(401)
         .json({
-
           success: false,
-
           error:
             "Invalid signature"
         });
     }
 
-    // ======================================================
-    // RESPOND TO PATHAO IMMEDIATELY
-    // ======================================================
-
     res
       .status(202)
       .json({
-
         success: true,
-
         received: true
       });
 
-    // ======================================================
-    // PROCESS
-    // ======================================================
-
     processWebhook(
       body
-    )
-      .catch(error => {
+    ).catch(error => {
 
-        console.error(
-          "❌ Webhook processing error:",
-          error.message
-        );
+      console.error(
+        "❌ Webhook processing error:",
+        error.message
+      );
 
-        stats.errors +=
-          1;
-      });
+      stats.errors += 1;
+    });
   }
 );
 
@@ -1813,11 +1723,8 @@ app.use(
     res
       .status(404)
       .json({
-
         success: false,
-
-        error:
-          "Not found"
+        error: "Not found"
       });
   }
 );
@@ -1852,11 +1759,11 @@ app.listen(
     );
 
     console.log(
-      `🔎 Max search: ${SHOPIFY_SEARCH_LIMIT}`
+      `🚚 Carrier: ${TRACKING_CARRIER}`
     );
 
     console.log(
-      `🚚 Carrier: ${TRACKING_CARRIER}`
+      "📱 Phone source: Shopify order"
     );
 
     console.log(
@@ -1864,73 +1771,15 @@ app.listen(
     );
 
     console.log(
-      "   https://merchant.pathao.com/tracking?consignment_id=...&phone=..."
+      "https://merchant.pathao.com/tracking?consignment_id=...&phone=..."
     );
 
     console.log(
       "========================================"
     );
-
-    console.log("");
-
-    console.log(
-      "📌 POST /webhooks/pathao"
-    );
-
-    console.log("");
-
-    console.log(
-      "🔄 FLOW:"
-    );
-
-    console.log(
-      "1. Receive Pathao webhook"
-    );
-
-    console.log(
-      "2. Verify Pathao consignment"
-    );
-
-    console.log(
-      "3. Read Pathao phone number"
-    );
-
-    console.log(
-      "4. Build unique Pathao tracking URL"
-    );
-
-    console.log(
-      "5. Search Shopify newest → oldest"
-    );
-
-    console.log(
-      "6. Require EXACT Shopify order name"
-    );
-
-    console.log(
-      "7. Release ON_HOLD if needed"
-    );
-
-    console.log(
-      "8. Fulfill Shopify"
-    );
-
-    console.log(
-      "9. Tracking number = Pathao consignment"
-    );
-
-    console.log(
-      `10. Carrier = ${TRACKING_CARRIER}`
-    );
-
-    console.log("");
 
     console.log(
       "✅ Ready!"
-    );
-
-    console.log(
-      "========================================"
     );
   }
 );
