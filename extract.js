@@ -147,22 +147,19 @@ async function getPathaoToken() {
 async function getShopifyOrderByName(orderName) {
   const token = await getShopifyToken();
 
+  // Use fulfillmentOrders directly (doesn't require orders scope)
   const query = `
-    query GetOrder($name: String!) {
-      orders(first: 1, query: $name) {
+    query GetOrder($search: String!) {
+      fulfillmentOrders(first: 5, query: $search) {
         nodes {
           id
-          name
-          fulfillmentOrders(first: 10) {
+          orderName
+          orderId
+          status
+          fulfillments(first: 10) {
             nodes {
               id
               status
-              fulfillments(first: 10) {
-                nodes {
-                  id
-                  status
-                }
-              }
             }
           }
         }
@@ -178,7 +175,7 @@ async function getShopifyOrderByName(orderName) {
         'X-Shopify-Access-Token': token,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ query, variables: { name: `name:${orderName}` } })
+      body: JSON.stringify({ query, variables: { search: `order_name:${orderName}` } })
     }
   );
 
@@ -189,8 +186,21 @@ async function getShopifyOrderByName(orderName) {
     throw new Error(payload.errors[0]?.message);
   }
 
-  const orders = payload.data?.orders?.nodes || [];
-  return orders[0] || null;
+  const fulfillmentOrders = payload.data?.fulfillmentOrders?.nodes || [];
+  
+  if (fulfillmentOrders.length === 0) {
+    return null;
+  }
+
+  // Convert fulfillmentOrder to order-like format
+  const fo = fulfillmentOrders[0];
+  return {
+    id: fo.orderId,
+    name: fo.orderName,
+    fulfillmentOrders: {
+      nodes: [fo]
+    }
+  };
 }
 
 // ============================================================
