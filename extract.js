@@ -35,6 +35,10 @@ const PATHAO_WEBHOOK_SECRET =
   process.env.PATHAO_WEBHOOK_SECRET ||
   "f3992ecc-59da-4cbe-a049-a13da2018d51";
 
+// ============================================================
+// TRACKING
+// ============================================================
+
 const TRACKING_URL =
   "https://pcom.page.link/ZvxGGEEgwsiFguMA8";
 
@@ -61,8 +65,9 @@ let pathaoTokenExpires = 0;
 let stats = {
   webhooks_received: 0,
   webhooks_processed: 0,
-  updates_sent: 0,
+  fulfilled: 0,
   tracking_updates: 0,
+  already_fulfilled: 0,
   errors: 0,
   last_webhook: null
 };
@@ -99,7 +104,9 @@ async function fetchTimeout(
         signal: controller.signal
       }
     );
+
   } catch (error) {
+
     if (
       error.name === "AbortError"
     ) {
@@ -109,12 +116,14 @@ async function fetchTimeout(
     }
 
     throw error;
+
   } finally {
     clearTimeout(timer);
   }
 }
 
 function normalizeOrderName(value) {
+
   return String(value || "")
     .trim()
     .toUpperCase();
@@ -170,6 +179,7 @@ async function getShopifyToken() {
     !response.ok ||
     !data.access_token
   ) {
+
     throw new Error(
       `Shopify token failed: ${JSON.stringify(data)}`
     );
@@ -246,6 +256,7 @@ async function getPathaoToken() {
     !response.ok ||
     !data.access_token
   ) {
+
     throw new Error(
       `Pathao token failed: ${JSON.stringify(data)}`
     );
@@ -304,6 +315,7 @@ async function shopifyGraphQL(
     await response.json();
 
   if (!response.ok) {
+
     throw new Error(
       `Shopify HTTP ${response.status}: ${JSON.stringify(payload)}`
     );
@@ -312,6 +324,7 @@ async function shopifyGraphQL(
   if (
     payload.errors?.length
   ) {
+
     throw new Error(
       payload.errors
         .map(error =>
@@ -325,10 +338,10 @@ async function shopifyGraphQL(
 }
 
 // ============================================================
-// GET PATHAO ORDER
+// PATHAO ORDER CHECK
 // ============================================================
 
-async function getPathaoOrderStatus(
+async function getPathaoOrder(
   consignmentId
 ) {
 
@@ -354,10 +367,17 @@ async function getPathaoOrderStatus(
       }
     );
 
-  const data =
-    await response.json();
+  let data = {};
+
+  try {
+    data =
+      await response.json();
+  } catch (_) {
+    data = {};
+  }
 
   if (!response.ok) {
+
     throw new Error(
       `Pathao ${response.status}: ${JSON.stringify(data)}`
     );
@@ -367,11 +387,13 @@ async function getPathaoOrderStatus(
 }
 
 // ============================================================
-// EXACT SHOPIFY ORDER LOOKUP
-// FIXED: fulfillments is direct list, NOT nodes
+// FIND SHOPIFY FULFILLMENT ORDERS
+//
+// IMPORTANT:
+// NO "orders" ROOT QUERY USED.
 // ============================================================
 
-async function getExactShopifyOrder(
+async function getShopifyOrderByName(
   merchantOrderId
 ) {
 
@@ -381,47 +403,39 @@ async function getExactShopifyOrder(
     );
 
   const query = `
-    query FindOrder(
+    query FindFulfillmentOrders(
       $search: String!
     ) {
-      orders(
-        first: 20,
+
+      fulfillmentOrders(
+        first: 50,
+        includeClosed: true,
         query: $search
       ) {
-        nodes {
-          id
-          name
-          createdAt
-          displayFulfillmentStatus
 
-          consignment: metafield(
-            namespace: "pathao",
-            key: "consignment_id"
-          ) {
-            value
+        nodes {
+
+          id
+          orderId
+          orderName
+          status
+          requestStatus
+
+          fulfillmentHolds {
+            id
+            reason
+            reasonNotes
           }
 
           fulfillments(first: 20) {
-            id
-            status
-
-            trackingInfo {
-              company
-              number
-              url
-            }
-          }
-
-          fulfillmentOrders(first: 20) {
             nodes {
               id
               status
-              requestStatus
 
-              fulfillmentHolds {
-                id
-                reason
-                reasonNotes
+              trackingInfo {
+                company
+                number
+                url
               }
             }
           }
@@ -430,191 +444,153 @@ async function getExactShopifyOrder(
     }
   `;
 
+  // ==========================================================
+  // FIRST SEARCH
+  // ==========================================================
+
   let data =
     await shopifyGraphQL(
       query,
       {
         search:
-          `name:${merchantOrderId}`
+          `order_name:${merchantOrderId}`
       }
     );
 
-  let orders =
-    data?.orders?.nodes || [];
+  let fulfillmentOrders =
+    data
+      ?.fulfillmentOrders
+      ?.nodes || [];
 
-  let exact =
-    orders.find(
-      order =>
+  // ==========================================================
+  // EXACT MATCH ONLY
+  // ==========================================================
+
+  let exactMatches =
+    fulfillmentOrders.filter(
+      fo =>
         normalizeOrderName(
-          order.name
+          fo.orderName
         ) === expected
     );
 
-  // fallback without #
-  if (!exact) {
+  // ==========================================================
+  // FALLBACK SEARCH
+  // Still requires exact match afterwards.
+  // ==========================================================
 
-    const clean =
-      String(
-        merchantOrderId
-      )
-        .replace(/^#/, "")
-        .trim();
+  if (
+    exactMatches.length === 0
+  ) {
+
+    console.log(
+      "   🔄 Trying fallback Shopify search..."
+    );
 
     data =
       await shopifyGraphQL(
         query,
         {
           search:
-            `name:${clean}`
+            merchantOrderId
         }
       );
 
-    orders =
-      data?.orders?.nodes || [];
+    fulfillmentOrders =
+      data
+        ?.fulfillmentOrders
+        ?.nodes || [];
 
-    exact =
-      orders.find(
-        order =>
+    exactMatches =
+      fulfillmentOrders.filter(
+        fo =>
           normalizeOrderName(
-            order.name
+            fo.orderName
           ) === expected
       );
   }
 
-  if (!exact) {
+  // ==========================================================
+  // NOT FOUND
+  // ==========================================================
+
+  if (
+    exactMatches.length === 0
+  ) {
+
+    console.log(
+      `   ❌ Exact Shopify order not found: ${merchantOrderId}`
+    );
+
+    if (
+      fulfillmentOrders.length >
+      0
+    ) {
+
+      console.log(
+        "   ⚠️ Shopify returned these different orders:"
+      );
+
+      for (
+        const fo
+        of fulfillmentOrders
+      ) {
+
+        console.log(
+          `      ${fo.orderName}`
+        );
+      }
+    }
+
     return null;
   }
 
-  if (
-    normalizeOrderName(
-      exact.name
-    ) !== expected
+  // ==========================================================
+  // FINAL SAFETY CHECK
+  // ==========================================================
+
+  for (
+    const fo
+    of exactMatches
   ) {
-    throw new Error(
-      `ORDER MISMATCH BLOCKED: Pathao=${merchantOrderId}, Shopify=${exact.name}`
-    );
-  }
 
-  return exact;
-}
-
-// ============================================================
-// SAVE TRACKING INFO ON ORDER METAFIELDS
-// ============================================================
-
-async function savePathaoTrackingOnOrder(
-  orderId,
-  consignmentId
-) {
-
-  const mutation = `
-    mutation UpdateOrder(
-      $input: OrderInput!
+    if (
+      normalizeOrderName(
+        fo.orderName
+      ) !== expected
     ) {
-      orderUpdate(
-        input: $input
-      ) {
-        order {
-          id
-          name
-        }
 
-        userErrors {
-          field
-          message
-        }
-      }
+      throw new Error(
+        `ORDER MISMATCH BLOCKED: Pathao=${merchantOrderId}, Shopify=${fo.orderName}`
+      );
     }
-  `;
-
-  const variables = {
-
-    input: {
-
-      id:
-        orderId,
-
-      metafields: [
-
-        {
-          namespace:
-            "pathao",
-
-          key:
-            "consignment_id",
-
-          type:
-            "single_line_text_field",
-
-          value:
-            String(
-              consignmentId
-            )
-        },
-
-        {
-          namespace:
-            "pathao",
-
-          key:
-            "tracking_url",
-
-          type:
-            "url",
-
-          value:
-            TRACKING_URL
-        },
-
-        {
-          namespace:
-            "pathao",
-
-          key:
-            "carrier",
-
-          type:
-            "single_line_text_field",
-
-          value:
-            TRACKING_CARRIER
-        }
-      ]
-    }
-  };
-
-  const data =
-    await shopifyGraphQL(
-      mutation,
-      variables
-    );
-
-  const result =
-    data?.orderUpdate;
-
-  if (
-    result
-      ?.userErrors
-      ?.length
-  ) {
-    throw new Error(
-      result.userErrors
-        .map(error =>
-          error.message
-        )
-        .join(", ")
-    );
   }
 
   console.log(
-    "   ✅ Pathao tracking saved on Shopify order"
+    `   ✅ EXACT Shopify order: ${merchantOrderId}`
   );
 
-  return true;
+  console.log(
+    `   📦 Fulfillment orders found: ${exactMatches.length}`
+  );
+
+  return {
+
+    id:
+      exactMatches[0]
+        .orderId,
+
+    name:
+      exactMatches[0]
+        .orderName,
+
+    fulfillmentOrders:
+      exactMatches
+  };
 }
 
 // ============================================================
-// GET FULFILLMENT ORDER
+// GET FRESH FULFILLMENT ORDER
 // ============================================================
 
 async function getFulfillmentOrder(
@@ -625,10 +601,14 @@ async function getFulfillmentOrder(
     query GetFulfillmentOrder(
       $id: ID!
     ) {
+
       fulfillmentOrder(
         id: $id
       ) {
+
         id
+        orderId
+        orderName
         status
         requestStatus
 
@@ -636,6 +616,21 @@ async function getFulfillmentOrder(
           id
           reason
           reasonNotes
+        }
+
+        fulfillments(first: 20) {
+
+          nodes {
+
+            id
+            status
+
+            trackingInfo {
+              company
+              number
+              url
+            }
+          }
         }
       }
     }
@@ -651,25 +646,27 @@ async function getFulfillmentOrder(
     );
 
   return (
-    data?.fulfillmentOrder ||
+    data
+      ?.fulfillmentOrder ||
     null
   );
 }
 
 // ============================================================
-// RELEASE HOLD
+// RELEASE FULFILLMENT HOLD
 // ============================================================
 
 async function releaseFulfillmentHold(
   fulfillmentOrder
 ) {
 
+  const holds =
+    fulfillmentOrder
+      ?.fulfillmentHolds ||
+    [];
+
   const holdIds =
-    (
-      fulfillmentOrder
-        ?.fulfillmentHolds ||
-      []
-    )
+    holds
       .map(hold =>
         hold.id
       )
@@ -678,13 +675,14 @@ async function releaseFulfillmentHold(
   if (
     holdIds.length === 0
   ) {
+
     throw new Error(
-      "Fulfillment is ON_HOLD but no hold IDs were found."
+      "Fulfillment is ON_HOLD but Shopify returned no hold IDs."
     );
   }
 
   console.log(
-    `      🔓 Releasing ${holdIds.length} hold(s)`
+    `      🔓 Releasing ${holdIds.length} hold(s)...`
   );
 
   const mutation = `
@@ -692,13 +690,16 @@ async function releaseFulfillmentHold(
       $id: ID!,
       $holdIds: [ID!]
     ) {
+
       fulfillmentOrderReleaseHold(
         id: $id,
         holdIds: $holdIds
       ) {
+
         fulfillmentOrder {
           id
           status
+          requestStatus
         }
 
         userErrors {
@@ -714,10 +715,12 @@ async function releaseFulfillmentHold(
     await shopifyGraphQL(
       mutation,
       {
+
         id:
           fulfillmentOrder.id,
 
-        holdIds
+        holdIds:
+          holdIds
       }
     );
 
@@ -730,6 +733,7 @@ async function releaseFulfillmentHold(
       ?.userErrors
       ?.length
   ) {
+
     throw new Error(
       result.userErrors
         .map(error =>
@@ -740,17 +744,25 @@ async function releaseFulfillmentHold(
   }
 
   console.log(
-    "      ✅ Hold released"
+    `      ✅ Hold released`
   );
 
-  return true;
+  console.log(
+    `      📍 New status: ${result?.fulfillmentOrder?.status}`
+  );
+
+  return (
+    result
+      ?.fulfillmentOrder ||
+    null
+  );
 }
 
 // ============================================================
 // CREATE FULFILLMENT + TRACKING
 // ============================================================
 
-async function createFulfillmentWithTracking(
+async function createFulfillment(
   fulfillmentOrderId,
   consignmentId
 ) {
@@ -765,10 +777,12 @@ async function createFulfillmentWithTracking(
       ) {
 
         fulfillment {
+
           id
           status
 
           trackingInfo {
+
             company
             number
             url
@@ -787,15 +801,16 @@ async function createFulfillmentWithTracking(
 
     fulfillment: {
 
-      notifyCustomer:
-        false,
-
       lineItemsByFulfillmentOrder: [
+
         {
           fulfillmentOrderId:
             fulfillmentOrderId
         }
       ],
+
+      notifyCustomer:
+        false,
 
       trackingInfo: {
 
@@ -820,13 +835,15 @@ async function createFulfillmentWithTracking(
     );
 
   const result =
-    data?.fulfillmentCreate;
+    data
+      ?.fulfillmentCreate;
 
   if (
     result
       ?.userErrors
       ?.length
   ) {
+
     throw new Error(
       result.userErrors
         .map(error =>
@@ -837,16 +854,20 @@ async function createFulfillmentWithTracking(
   }
 
   if (
-    !result
-      ?.fulfillment
+    !result?.fulfillment
   ) {
+
     throw new Error(
-      "Shopify fulfillment was not created."
+      "Shopify did not create fulfillment."
     );
   }
 
   console.log(
-    "      ✅ Fulfillment created"
+    `      ✅ Shopify fulfillment created`
+  );
+
+  console.log(
+    `      🆔 ${result.fulfillment.id}`
   );
 
   console.log(
@@ -865,7 +886,8 @@ async function createFulfillmentWithTracking(
 }
 
 // ============================================================
-// UPDATE EXISTING FULFILLMENT TRACKING
+// UPDATE TRACKING
+// FOR EXISTING/CLOSED FULFILLMENT
 // ============================================================
 
 async function updateFulfillmentTracking(
@@ -876,16 +898,18 @@ async function updateFulfillmentTracking(
   const mutation = `
     mutation UpdateTracking(
       $fulfillmentId: ID!,
-      $trackingInfoInput: FulfillmentTrackingInput!
+      $trackingInfoInput: FulfillmentTrackingInput!,
+      $notifyCustomer: Boolean
     ) {
 
       fulfillmentTrackingInfoUpdate(
         fulfillmentId: $fulfillmentId,
         trackingInfoInput: $trackingInfoInput,
-        notifyCustomer: false
+        notifyCustomer: $notifyCustomer
       ) {
 
         fulfillment {
+
           id
           status
 
@@ -904,27 +928,33 @@ async function updateFulfillmentTracking(
     }
   `;
 
+  const variables = {
+
+    fulfillmentId:
+      fulfillmentId,
+
+    notifyCustomer:
+      false,
+
+    trackingInfoInput: {
+
+      company:
+        TRACKING_CARRIER,
+
+      number:
+        String(
+          consignmentId
+        ),
+
+      url:
+        TRACKING_URL
+    }
+  };
+
   const data =
     await shopifyGraphQL(
       mutation,
-      {
-
-        fulfillmentId,
-
-        trackingInfoInput: {
-
-          company:
-            TRACKING_CARRIER,
-
-          number:
-            String(
-              consignmentId
-            ),
-
-          url:
-            TRACKING_URL
-        }
-      }
+      variables
     );
 
   const result =
@@ -936,6 +966,7 @@ async function updateFulfillmentTracking(
       ?.userErrors
       ?.length
   ) {
+
     throw new Error(
       result.userErrors
         .map(error =>
@@ -949,25 +980,36 @@ async function updateFulfillmentTracking(
     1;
 
   console.log(
-    "      ✅ Existing tracking updated"
+    "      ✅ Existing fulfillment tracking updated"
   );
 
-  return result
-    ?.fulfillment;
+  console.log(
+    `      🔢 ${consignmentId}`
+  );
+
+  return result?.fulfillment;
 }
 
 // ============================================================
-// UPDATE TRACKING ON ALL EXISTING FULFILLMENTS
-// FIXED: order.fulfillments is direct array
+// UPDATE TRACKING ON EXISTING FULFILLMENTS
 // ============================================================
 
-async function updateExistingTracking(
-  order,
+async function updateExistingFulfillments(
+  fulfillmentOrder,
   consignmentId
 ) {
 
   const fulfillments =
-    order?.fulfillments || [];
+    fulfillmentOrder
+      ?.fulfillments
+      ?.nodes || [];
+
+  if (
+    fulfillments.length === 0
+  ) {
+
+    return 0;
+  }
 
   let updated = 0;
 
@@ -978,6 +1020,10 @@ async function updateExistingTracking(
 
     try {
 
+      console.log(
+        `      🔄 Updating tracking: ${fulfillment.id}`
+      );
+
       await updateFulfillmentTracking(
         fulfillment.id,
         consignmentId
@@ -987,7 +1033,7 @@ async function updateExistingTracking(
 
     } catch (error) {
 
-      console.log(
+      console.error(
         `      ⚠️ Tracking update failed: ${error.message}`
       );
     }
@@ -999,198 +1045,314 @@ async function updateExistingTracking(
 }
 
 // ============================================================
-// FULFILL SHOPIFY ORDER
+// PROCESS ONE FULFILLMENT ORDER
 // ============================================================
 
-async function fulfillShopifyOrder(
-  order,
+async function processFulfillmentOrder(
+  fulfillmentOrderId,
+  merchantOrderId,
   consignmentId
 ) {
 
-  // Always save tracking
-  await savePathaoTrackingOnOrder(
-    order.id,
-    consignmentId
-  );
+  let fulfillmentOrder =
+    await getFulfillmentOrder(
+      fulfillmentOrderId
+    );
 
-  // ========================================================
-  // ALREADY FULFILLED
-  // ========================================================
+  if (!fulfillmentOrder) {
+
+    throw new Error(
+      `Fulfillment order not found: ${fulfillmentOrderId}`
+    );
+  }
+
+  // ==========================================================
+  // EXACT MATCH AGAIN
+  // ==========================================================
 
   if (
+    normalizeOrderName(
+      fulfillmentOrder.orderName
+    ) !==
+    normalizeOrderName(
+      merchantOrderId
+    )
+  ) {
+
+    throw new Error(
+      `ORDER MISMATCH BLOCKED: Pathao=${merchantOrderId}, Shopify=${fulfillmentOrder.orderName}`
+    );
+  }
+
+  let status =
     String(
-      order
-        .displayFulfillmentStatus ||
+      fulfillmentOrder.status ||
       ""
-    ).toUpperCase() ===
-    "FULFILLED"
+    ).toUpperCase();
+
+  console.log(
+    `      📍 Status: ${status}`
+  );
+
+  // ==========================================================
+  // CLOSED
+  // ORDER ALREADY FULFILLED
+  // UPDATE TRACKING
+  // ==========================================================
+
+  if (
+    status === "CLOSED"
   ) {
 
     console.log(
-      "   ✅ Shopify already fulfilled"
+      "      ✅ Already fulfilled"
     );
 
-    await updateExistingTracking(
-      order,
+    await updateExistingFulfillments(
+      fulfillmentOrder,
       consignmentId
     );
 
     return {
-      changed: 0,
+      fulfilled: false,
       alreadyFulfilled: true
     };
   }
 
-  // ========================================================
-  // FULFILLMENT ORDERS
-  // ========================================================
+  // ==========================================================
+  // CANCELLED
+  // ==========================================================
 
-  const fulfillmentOrders =
-    order
-      ?.fulfillmentOrders
+  if (
+    status === "CANCELLED"
+  ) {
+
+    console.log(
+      "      ⏭ Fulfillment order cancelled"
+    );
+
+    return {
+      fulfilled: false,
+      cancelled: true
+    };
+  }
+
+  // ==========================================================
+  // ON HOLD
+  // ==========================================================
+
+  if (
+    status === "ON_HOLD"
+  ) {
+
+    console.log(
+      "      ⚠️ Fulfillment order ON_HOLD"
+    );
+
+    await releaseFulfillmentHold(
+      fulfillmentOrder
+    );
+
+    await sleep(500);
+
+    // Get fresh status
+    fulfillmentOrder =
+      await getFulfillmentOrder(
+        fulfillmentOrderId
+      );
+
+    status =
+      String(
+        fulfillmentOrder?.status ||
+        ""
+      ).toUpperCase();
+
+    console.log(
+      `      🔄 After hold release: ${status}`
+    );
+
+    if (
+      status === "ON_HOLD"
+    ) {
+
+      throw new Error(
+        "Shopify fulfillment order is still ON_HOLD."
+      );
+    }
+  }
+
+  // ==========================================================
+  // CHECK EXISTING FULFILLMENTS
+  // ==========================================================
+
+  const existing =
+    fulfillmentOrder
+      ?.fulfillments
       ?.nodes || [];
 
   if (
-    fulfillmentOrders.length === 0
+    existing.length > 0 &&
+    status !== "OPEN" &&
+    status !== "IN_PROGRESS"
   ) {
-    throw new Error(
-      `No fulfillment orders found for ${order.name}`
+
+    await updateExistingFulfillments(
+      fulfillmentOrder,
+      consignmentId
     );
   }
 
-  let changed = 0;
+  // ==========================================================
+  // OPEN / IN_PROGRESS
+  // CREATE FULFILLMENT
+  // ==========================================================
+
+  if (
+    status === "OPEN" ||
+    status === "IN_PROGRESS"
+  ) {
+
+    console.log(
+      "      📦 Creating fulfillment..."
+    );
+
+    await createFulfillment(
+      fulfillmentOrder.id,
+      consignmentId
+    );
+
+    return {
+      fulfilled: true,
+      alreadyFulfilled: false
+    };
+  }
+
+  // ==========================================================
+  // SCHEDULED
+  // Shopify may not allow immediate fulfillment
+  // ==========================================================
+
+  if (
+    status === "SCHEDULED"
+  ) {
+
+    console.log(
+      "      ⚠️ Fulfillment order is SCHEDULED"
+    );
+
+    try {
+
+      await createFulfillment(
+        fulfillmentOrder.id,
+        consignmentId
+      );
+
+      return {
+        fulfilled: true,
+        alreadyFulfilled: false
+      };
+
+    } catch (error) {
+
+      throw new Error(
+        `Scheduled fulfillment could not be fulfilled: ${error.message}`
+      );
+    }
+  }
+
+  throw new Error(
+    `Unsupported fulfillment order status=${status}`
+  );
+}
+
+// ============================================================
+// FULFILL EXACT SHOPIFY ORDER
+// ============================================================
+
+async function fulfillExactShopifyOrder(
+  merchantOrderId,
+  consignmentId
+) {
+
+  const shopifyOrder =
+    await getShopifyOrderByName(
+      merchantOrderId
+    );
+
+  if (!shopifyOrder) {
+
+    throw new Error(
+      `Exact Shopify order not found: ${merchantOrderId}`
+    );
+  }
+
+  // ==========================================================
+  // FINAL EXACT CHECK
+  // ==========================================================
+
+  if (
+    normalizeOrderName(
+      shopifyOrder.name
+    ) !==
+    normalizeOrderName(
+      merchantOrderId
+    )
+  ) {
+
+    throw new Error(
+      `ORDER MISMATCH BLOCKED: ${merchantOrderId} != ${shopifyOrder.name}`
+    );
+  }
+
+  let fulfilledCount = 0;
+  let alreadyCount = 0;
 
   for (
-    let fulfillmentOrder
-    of fulfillmentOrders
+    const fulfillmentOrder
+    of shopifyOrder.fulfillmentOrders
   ) {
 
     console.log(
       `   📦 Fulfillment Order: ${fulfillmentOrder.id}`
     );
 
-    let fresh =
-      await getFulfillmentOrder(
-        fulfillmentOrder.id
-      );
-
-    if (!fresh) {
-      continue;
-    }
-
-    let status =
-      String(
-        fresh.status || ""
-      ).toUpperCase();
-
-    console.log(
-      `      Status: ${status}`
-    );
-
-    // ======================================================
-    // CLOSED
-    // ======================================================
-
-    if (
-      status === "CLOSED"
-    ) {
-
-      console.log(
-        "      ✅ Already closed"
-      );
-
-      continue;
-    }
-
-    // ======================================================
-    // CANCELLED
-    // ======================================================
-
-    if (
-      status === "CANCELLED"
-    ) {
-
-      console.log(
-        "      ⏭ Cancelled"
-      );
-
-      continue;
-    }
-
-    // ======================================================
-    // ON HOLD
-    // ======================================================
-
-    if (
-      status === "ON_HOLD"
-    ) {
-
-      console.log(
-        "      ⚠️ ON_HOLD"
-      );
-
-      await releaseFulfillmentHold(
-        fresh
-      );
-
-      await sleep(500);
-
-      fresh =
-        await getFulfillmentOrder(
-          fulfillmentOrder.id
-        );
-
-      status =
-        String(
-          fresh?.status || ""
-        ).toUpperCase();
-
-      console.log(
-        `      🔄 Status after hold release: ${status}`
-      );
-
-      if (
-        status === "ON_HOLD"
-      ) {
-        throw new Error(
-          "Fulfillment still ON_HOLD after release."
-        );
-      }
-    }
-
-    // ======================================================
-    // CREATE FULFILLMENT
-    // ======================================================
-
-    if (
-      status === "OPEN" ||
-      status === "IN_PROGRESS" ||
-      status === "SCHEDULED"
-    ) {
-
-      await createFulfillmentWithTracking(
+    const result =
+      await processFulfillmentOrder(
         fulfillmentOrder.id,
+        merchantOrderId,
         consignmentId
       );
 
-      changed++;
+    if (
+      result.fulfilled
+    ) {
 
-      continue;
+      fulfilledCount++;
     }
 
-    console.log(
-      `      ⚠️ Unsupported status: ${status}`
-    );
+    if (
+      result.alreadyFulfilled
+    ) {
+
+      alreadyCount++;
+    }
+
+    await sleep(300);
   }
 
   return {
-    changed,
-    alreadyFulfilled: false
+
+    orderName:
+      shopifyOrder.name,
+
+    fulfilledCount,
+
+    alreadyCount
   };
 }
 
 // ============================================================
-// VERIFY WEBHOOK
+// VERIFY PATHAO WEBHOOK
 // ============================================================
 
 function verifyWebhookSignature(
@@ -1201,6 +1363,7 @@ function verifyWebhookSignature(
     !signature ||
     !PATHAO_WEBHOOK_SECRET
   ) {
+
     return false;
   }
 
@@ -1217,14 +1380,17 @@ function verifyWebhookSignature(
 // PROCESS WEBHOOK
 //
 // RULE:
-// IF PATHAO ORDER EXISTS -> FULFILL SHOPIFY
+//
+// IF CONSIGNMENT EXISTS IN PATHAO
+// => FULFILL SHOPIFY
 // ============================================================
 
 async function processWebhook(
   body
 ) {
 
-  stats.webhooks_received += 1;
+  stats.webhooks_received +=
+    1;
 
   stats.last_webhook =
     new Date()
@@ -1274,23 +1440,23 @@ async function processWebhook(
 
   try {
 
-    // ======================================================
-    // 1. CHECK PATHAO
-    // ======================================================
+    // ========================================================
+    // 1. VERIFY PATHAO ORDER EXISTS
+    // ========================================================
 
     console.log(
       "🔎 Verifying Pathao order..."
     );
 
     const pathaoOrder =
-      await getPathaoOrderStatus(
+      await getPathaoOrder(
         consignmentId
       );
 
     if (!pathaoOrder) {
 
       throw new Error(
-        `Pathao order does not exist: ${consignmentId}`
+        `Pathao order not found: ${consignmentId}`
       );
     }
 
@@ -1298,71 +1464,50 @@ async function processWebhook(
       "✅ Pathao order exists"
     );
 
-    // ======================================================
-    // 2. EXACT SHOPIFY ORDER
-    // ======================================================
-
-    const order =
-      await getExactShopifyOrder(
-        merchantOrderId
-      );
-
-    if (!order) {
-
-      throw new Error(
-        `Exact Shopify order not found: ${merchantOrderId}`
-      );
-    }
-
-    if (
-      normalizeOrderName(
-        order.name
-      ) !==
-      normalizeOrderName(
-        merchantOrderId
-      )
-    ) {
-
-      throw new Error(
-        `ORDER MISMATCH BLOCKED: ${merchantOrderId} != ${order.name}`
-      );
-    }
+    // ========================================================
+    // 2. FULFILL EXACT SHOPIFY ORDER
+    // ========================================================
 
     console.log(
-      `✅ Exact Shopify order: ${order.name}`
-    );
-
-    // ======================================================
-    // 3. FULFILL
-    // ======================================================
-
-    console.log(
-      "➡️ Fulfilling Shopify..."
+      "🔎 Finding exact Shopify fulfillment order..."
     );
 
     const result =
-      await fulfillShopifyOrder(
-        order,
+      await fulfillExactShopifyOrder(
+        merchantOrderId,
         consignmentId
       );
 
+    // ========================================================
+    // STATS
+    // ========================================================
+
     if (
-      result.changed > 0
+      result.fulfilledCount > 0
     ) {
 
-      stats.updates_sent +=
-        result.changed;
+      stats.fulfilled +=
+        result.fulfilledCount;
 
+      console.log("");
       console.log(
         "✅ SHOPIFY FULFILLED"
       );
+    }
 
-    } else if (
-      result.alreadyFulfilled
+    if (
+      result.alreadyCount > 0
     ) {
 
+      stats.already_fulfilled +=
+        result.alreadyCount;
+
       console.log(
-        "✅ Already fulfilled — tracking synchronized"
+        "✅ Shopify was already fulfilled"
+      );
+
+      console.log(
+        "✅ Tracking synchronized"
       );
     }
 
@@ -1412,11 +1557,14 @@ app.get(
         "Pathao → Shopify Auto Fulfillment",
 
       rule:
-        "If Pathao order exists → Shopify Fulfilled",
+        "If Pathao consignment exists → Shopify Fulfilled",
+
+      lookup:
+        "fulfillmentOrders only",
 
       tracking: {
 
-        tracking_number:
+        number:
           "Pathao consignment_id",
 
         carrier:
@@ -1475,14 +1623,16 @@ app.get(
   (req, res) => {
 
     res.json({
+
       success: true,
+
       stats
     });
   }
 );
 
 // ============================================================
-// TEST
+// TEST CONNECTIONS
 // ============================================================
 
 app.get(
@@ -1536,14 +1686,17 @@ app.post(
     const body =
       req.body || {};
 
-    // verification handshake
+    // ========================================================
+    // VERIFICATION HANDSHAKE
+    // ========================================================
+
     if (
       body.event ===
       "webhook_integration"
     ) {
 
       console.log(
-        "✅ Pathao webhook verification"
+        "✅ Pathao webhook verification handshake"
       );
 
       res.set(
@@ -1562,7 +1715,10 @@ app.post(
         });
     }
 
-    // signature
+    // ========================================================
+    // VERIFY SIGNATURE
+    // ========================================================
+
     if (
       !verifyWebhookSignature(
         signature
@@ -1584,7 +1740,10 @@ app.post(
         });
     }
 
-    // respond immediately
+    // ========================================================
+    // RESPOND TO PATHAO IMMEDIATELY
+    // ========================================================
+
     res
       .status(202)
       .json({
@@ -1594,7 +1753,10 @@ app.post(
         received: true
       });
 
-    // process
+    // ========================================================
+    // PROCESS
+    // ========================================================
+
     processWebhook(
       body
     )
@@ -1658,6 +1820,10 @@ app.listen(
     );
 
     console.log(
+      "🔎 Shopify lookup: fulfillmentOrders"
+    );
+
+    console.log(
       `🚚 Carrier: ${TRACKING_CARRIER}`
     );
 
@@ -1682,7 +1848,7 @@ app.listen(
     );
 
     console.log(
-      "1. Pathao webhook received"
+      "1. Receive Pathao webhook"
     );
 
     console.log(
@@ -1690,27 +1856,31 @@ app.listen(
     );
 
     console.log(
-      "3. Find EXACT Shopify order"
+      "3. Search Shopify fulfillmentOrders"
     );
 
     console.log(
-      "4. Release ON_HOLD if needed"
+      "4. Require EXACT orderName match"
     );
 
     console.log(
-      "5. Fulfill Shopify"
+      "5. Release ON_HOLD if required"
     );
 
     console.log(
-      "6. Tracking number = Pathao consignment"
+      "6. Fulfill Shopify"
     );
 
     console.log(
-      `7. Carrier = ${TRACKING_CARRIER}`
+      "7. Tracking = Pathao consignment ID"
     );
 
     console.log(
-      `8. URL = ${TRACKING_URL}`
+      `8. Carrier = ${TRACKING_CARRIER}`
+    );
+
+    console.log(
+      `9. URL = ${TRACKING_URL}`
     );
 
     console.log("");
