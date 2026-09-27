@@ -104,7 +104,7 @@ async function getShopifyToken() {
 
   console.log('🔐 Requesting Shopify access token...');
 
-  const response = await fetch(`https://${SHOP}.myshopify.com/admin/oauth/access_token`, {
+  const response = await fetchWithTimeout(`https://${SHOP}.myshopify.com/admin/oauth/access_token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -139,7 +139,7 @@ async function getPathaoToken() {
 
   console.log('🔐 Requesting Pathao access token...');
 
-  const response = await fetch(`${PATHAO_BASE_URL}/aladdin/api/v1/issue-token`, {
+  const response = await fetchWithTimeout(`${PATHAO_BASE_URL}/aladdin/api/v1/issue-token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
@@ -173,12 +173,33 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 20000);
+
+// Node's fetch has no built-in timeout — without this, a single stalled
+// network request (Shopify or Pathao) can hang forever and, for the
+// poller, permanently block it from ever running again.
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const MAX_THROTTLE_RETRIES = 5;
 
 async function shopifyGraphQL(query, variables = {}, attempt = 1) {
   const token = await getShopifyToken();
 
-  const response = await fetch(`https://${SHOP}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+  const response = await fetchWithTimeout(`https://${SHOP}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
     method: 'POST',
     headers: {
       'X-Shopify-Access-Token': token,
@@ -240,7 +261,7 @@ async function shopifyGraphQL(query, variables = {}, attempt = 1) {
 async function getPathaoOrder(consignmentId) {
   const token = await getPathaoToken();
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `${PATHAO_BASE_URL}/aladdin/api/v1/orders/${encodeURIComponent(consignmentId)}/info`,
     {
       method: 'GET',
@@ -484,8 +505,17 @@ async function getPathaoFulfillmentTargets() {
 
   let after = null;
   let hasNextPage = true;
+  let page = 0;
+  const MAX_PAGES = 50; // hard safety cap: 50 x 100 = 5,000 orders max per scan
 
   while (hasNextPage) {
+    page += 1;
+
+    if (page > MAX_PAGES) {
+      console.warn(`⚠️ getPathaoFulfillmentTargets: hit MAX_PAGES (${MAX_PAGES}) safety cap, stopping scan early`);
+      break;
+    }
+
     const data = await shopifyGraphQL(query, {
       first: 100,
       after,
@@ -497,6 +527,8 @@ async function getPathaoFulfillmentTargets() {
     for (const fulfillmentOrder of connection.nodes || []) {
       targets.push(...extractPathaoTargetsFromFulfillmentOrderNode(fulfillmentOrder, seen));
     }
+
+    console.log(`  …scanned page ${page} (${connection.nodes?.length || 0} orders, ${targets.length} Pathao targets so far)`);
 
     hasNextPage = Boolean(connection.pageInfo.hasNextPage);
     after = connection.pageInfo.endCursor;
